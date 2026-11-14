@@ -3,21 +3,31 @@
 
 extern crate alloc;
 
-use alloc::{string::String, vec::Vec};
+#[path = "../secrets.rs"]
+#[allow(dead_code)]
+mod secrets;
+
+use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 use core::{
+    cell::RefCell,
     fmt::Write as _,
     sync::atomic::{AtomicU8, Ordering},
 };
+use critical_section::Mutex;
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either4, select, select4};
+use embassy_futures::select::{Either4, select4};
 use embassy_net::{
-    DhcpConfig, IpAddress, IpEndpoint, Ipv4Address, Ipv4Cidr, Stack, StackResources,
+    DhcpConfig, IpAddress, IpEndpoint, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources,
     StaticConfigV4,
+    dns::DnsSocket,
     icmp::{
         PacketMetadata as IcmpPacketMetadata,
         ping::{PingManager, PingParams},
     },
-    tcp::TcpSocket,
+    tcp::{
+        TcpSocket,
+        client::{TcpClient, TcpClientState},
+    },
     udp::{PacketMetadata, UdpSocket},
 };
 use embassy_time::{Duration, Timer, with_timeout};
@@ -40,7 +50,14 @@ use esp_radio::wifi::{
     scan::ScanConfig, sta::StationConfig,
 };
 use esp_storage::FlashStorage;
+use reqwless::{
+    client::{HttpClient, TlsConfig, TlsVerify},
+    headers::ContentType,
+    request::{Method, RequestBuilder as _},
+};
+use serde::{Deserialize, Serialize};
 use smart_leds::{RGB8, SmartLedsWrite, brightness};
+use static_cell::StaticCell;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -626,12 +643,379 @@ fn build_device_name() -> String {
     alloc::format!("SmartLight-{:02X}{:02X}", bytes[4], bytes[5])
 }
 
+static STA_NET_RESOURCES: StaticCell<StackResources<6>> = StaticCell::new();
+static FIREBASE_ID_TOKEN: Mutex<RefCell<Option<String>>> = Mutex::new(RefCell::new(None));
+
+const TLS_RX_BUF_LEN: usize = 16640;
+const TLS_TX_BUF_LEN: usize = 16640;
+const HTTP_RX_BUF_LEN: usize = 8192;
+const PAIRING_POLL_INTERVAL_SECS: u64 = 5;
+
+fn set_firebase_token(token: Option<String>) {
+    critical_section::with(|cs| {
+        *FIREBASE_ID_TOKEN.borrow_ref_mut(cs) = token;
+    });
+}
+
+fn get_firebase_token() -> Option<String> {
+    critical_section::with(|cs| FIREBASE_ID_TOKEN.borrow_ref(cs).clone())
+}
+
+#[derive(Serialize)]
+struct SignInRequest<'a> {
+    email: &'a str,
+    password: &'a str,
+    #[serde(rename = "returnSecureToken")]
+    return_secure_token: bool,
+}
+
+#[derive(Deserialize)]
+struct SignInResponse {
+    #[serde(rename = "idToken")]
+    id_token: String,
+    #[serde(rename = "expiresIn")]
+    expires_in: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FirestoreListResponse {
+    documents: Option<Vec<FirestoreDocument>>,
+}
+
+#[derive(Deserialize)]
+struct FirestoreDocument {
+    name: String,
+    fields: Option<PairingRequestFields>,
+}
+
+#[derive(Deserialize)]
+struct PairingRequestFields {
+    pin: Option<FirestoreValue>,
+    uid: Option<FirestoreValue>,
+}
+
+#[derive(Deserialize)]
+struct FirestoreValue {
+    #[serde(rename = "stringValue")]
+    string_value: Option<String>,
+    #[serde(rename = "integerValue")]
+    integer_value: Option<String>,
+}
+
+impl FirestoreValue {
+    fn as_str(&self) -> Option<&str> {
+        self.string_value
+            .as_deref()
+            .or(self.integer_value.as_deref())
+    }
+}
+
+#[derive(Serialize)]
+struct CommitRequest<'a> {
+    writes: [CommitWrite<'a>; 1],
+}
+
+#[derive(Serialize)]
+struct CommitWrite<'a> {
+    transform: DocumentTransform<'a>,
+}
+
+#[derive(Serialize)]
+struct DocumentTransform<'a> {
+    document: &'a str,
+    #[serde(rename = "fieldTransforms")]
+    field_transforms: [FieldTransform<'a>; 1],
+}
+
+#[derive(Serialize)]
+struct FieldTransform<'a> {
+    #[serde(rename = "fieldPath")]
+    field_path: &'a str,
+    #[serde(rename = "appendMissingElements")]
+    append_missing_elements: ArrayValue<'a>,
+}
+
+#[derive(Serialize)]
+struct ArrayValue<'a> {
+    values: [StringValue<'a>; 1],
+}
+
+#[derive(Serialize)]
+struct StringValue<'a> {
+    #[serde(rename = "stringValue")]
+    string_value: &'a str,
+}
+
+/// Executes an async HTTPS request over `embassy_net` using `reqwless` + `embedded-tls`.
+async fn https_request(
+    stack: Stack<'static>,
+    seed: u64,
+    method: Method,
+    url: &str,
+    bearer_token: Option<&str>,
+    body: Option<&[u8]>,
+) -> Result<(u16, Vec<u8>), &'static str> {
+    let tcp_state = Box::new(TcpClientState::<1, 4096, 4096>::new());
+    let tcp_client = TcpClient::new(stack, &tcp_state);
+    let dns_socket = DnsSocket::new(stack);
+
+    let mut tls_rx = vec![0u8; TLS_RX_BUF_LEN];
+    let mut tls_tx = vec![0u8; TLS_TX_BUF_LEN];
+    let tls_config = TlsConfig::new(seed, &mut tls_rx, &mut tls_tx, TlsVerify::None);
+    let mut client = HttpClient::new_with_tls(&tcp_client, &dns_socket, tls_config);
+
+    let auth_header = bearer_token.map(|t| format!("Bearer {}", t));
+    let mut extra_headers: [(&str, &str); 1] = [("", "")];
+
+    let mut req = client
+        .request(method, url)
+        .await
+        .map_err(|_| "HTTP request init failed")?;
+
+    if let Some(ref auth) = auth_header {
+        extra_headers[0] = ("Authorization", auth.as_str());
+        req = req.headers(&extra_headers);
+    }
+
+    let mut rx_buf = vec![0u8; HTTP_RX_BUF_LEN];
+    if let Some(payload) = body {
+        let mut req = req.content_type(ContentType::ApplicationJson).body(payload);
+        let resp = req
+            .send(&mut rx_buf)
+            .await
+            .map_err(|_| "HTTPS send failed")?;
+        let status = resp.status.0;
+        let resp_bytes = resp
+            .body()
+            .read_to_end()
+            .await
+            .map_err(|_| "HTTPS body read failed")?;
+        Ok((status, resp_bytes.to_vec()))
+    } else {
+        let resp = req
+            .send(&mut rx_buf)
+            .await
+            .map_err(|_| "HTTPS send failed")?;
+        let status = resp.status.0;
+        let resp_bytes = resp
+            .body()
+            .read_to_end()
+            .await
+            .map_err(|_| "HTTPS body read failed")?;
+        Ok((status, resp_bytes.to_vec()))
+    }
+}
+
+#[embassy_executor::task]
+async fn net_task(mut runner: Runner<'static, Interface>) -> ! {
+    runner.run().await
+}
+
+/// Authenticates the device with Firebase Auth and refreshes the ID token before expiry.
+#[embassy_executor::task]
+async fn firebase_auth_task(stack: Stack<'static>, seed: u64) -> ! {
+    let url = format!(
+        "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={}",
+        secrets::FIREBASE_API_KEY
+    );
+    let payload = SignInRequest {
+        email: secrets::DEVICE_AUTH_EMAIL,
+        password: secrets::DEVICE_AUTH_PASS,
+        return_secure_token: true,
+    };
+
+    loop {
+        stack.wait_config_up().await;
+
+        let body = match serde_json::to_vec(&payload) {
+            Ok(b) => b,
+            Err(_) => {
+                println!("Firebase Auth: failed to serialize request payload.");
+                Timer::after(Duration::from_secs(30)).await;
+                continue;
+            }
+        };
+
+        println!("Firebase Auth: signing in...");
+        match https_request(stack, seed, Method::POST, &url, None, Some(&body)).await {
+            Ok((status, resp_bytes)) if (200..300).contains(&status) => {
+                match serde_json::from_slice::<SignInResponse>(&resp_bytes) {
+                    Ok(auth) => {
+                        let expires_in_secs = auth
+                            .expires_in
+                            .as_deref()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(3600);
+                        set_firebase_token(Some(auth.id_token));
+                        println!(
+                            "Firebase Auth: authenticated (token expires in {}s).",
+                            expires_in_secs
+                        );
+                        let refresh_secs = expires_in_secs.saturating_sub(300).max(60);
+                        Timer::after(Duration::from_secs(refresh_secs)).await;
+                    }
+                    Err(_) => {
+                        println!("Firebase Auth: failed to parse JSON response.");
+                        Timer::after(Duration::from_secs(15)).await;
+                    }
+                }
+            }
+            Ok((status, _)) => {
+                println!("Firebase Auth: HTTP error status {}.", status);
+                set_firebase_token(None);
+                Timer::after(Duration::from_secs(15)).await;
+            }
+            Err(e) => {
+                println!("Firebase Auth: request error: {}", e);
+                Timer::after(Duration::from_secs(15)).await;
+            }
+        }
+    }
+}
+
+/// Polls Firestore for pairing requests, authorizes matching PINs, and deletes processed requests.
+#[embassy_executor::task]
+async fn pairing_poll_task(stack: Stack<'static>, seed: u64) -> ! {
+    let poll_url = format!(
+        "https://firestore.googleapis.com/v1/projects/{}/databases/(default)/documents/devices/{}/pairing_requests",
+        secrets::FIREBASE_PROJECT_ID,
+        secrets::DEVICE_ID
+    );
+    let commit_url = format!(
+        "https://firestore.googleapis.com/v1/projects/{}/databases/(default)/documents:commit",
+        secrets::FIREBASE_PROJECT_ID
+    );
+    let device_doc_path = format!(
+        "projects/{}/databases/(default)/documents/devices/{}",
+        secrets::FIREBASE_PROJECT_ID,
+        secrets::DEVICE_ID
+    );
+
+    loop {
+        stack.wait_config_up().await;
+
+        let Some(id_token) = get_firebase_token() else {
+            Timer::after(Duration::from_secs(2)).await;
+            continue;
+        };
+
+        match https_request(stack, seed, Method::GET, &poll_url, Some(&id_token), None).await {
+            Ok((401, _)) => {
+                println!("Pairing poll: token expired/unauthorized (401); waiting for refresh.");
+                set_firebase_token(None);
+            }
+            Ok((status, resp_bytes)) if (200..300).contains(&status) => {
+                if let Ok(list) = serde_json::from_slice::<FirestoreListResponse>(&resp_bytes) {
+                    if let Some(docs) = list.documents {
+                        for doc in docs {
+                            let Some(fields) = doc.fields else {
+                                continue;
+                            };
+                            let pin = fields.pin.as_ref().and_then(|v| v.as_str());
+                            let uid = fields.uid.as_ref().and_then(|v| v.as_str());
+
+                            if let (Some(pin), Some(uid)) = (pin, uid) {
+                                if pin == secrets::DEVICE_PIN {
+                                    println!("Pairing: valid PIN received for uid '{}'.", uid);
+                                    let commit_payload = CommitRequest {
+                                        writes: [CommitWrite {
+                                            transform: DocumentTransform {
+                                                document: &device_doc_path,
+                                                field_transforms: [FieldTransform {
+                                                    field_path: "allowedUsers",
+                                                    append_missing_elements: ArrayValue {
+                                                        values: [StringValue { string_value: uid }],
+                                                    },
+                                                }],
+                                            },
+                                        }],
+                                    };
+
+                                    if let Ok(commit_body) = serde_json::to_vec(&commit_payload) {
+                                        match https_request(
+                                            stack,
+                                            seed,
+                                            Method::POST,
+                                            &commit_url,
+                                            Some(&id_token),
+                                            Some(&commit_body),
+                                        )
+                                        .await
+                                        {
+                                            Ok((c_status, _)) if (200..300).contains(&c_status) => {
+                                                println!(
+                                                    "Pairing: added '{}' to allowedUsers.",
+                                                    uid
+                                                );
+                                                let delete_url = format!(
+                                                    "https://firestore.googleapis.com/v1/{}",
+                                                    doc.name
+                                                );
+                                                match https_request(
+                                                    stack,
+                                                    seed,
+                                                    Method::DELETE,
+                                                    &delete_url,
+                                                    Some(&id_token),
+                                                    None,
+                                                )
+                                                .await
+                                                {
+                                                    Ok((d_status, _))
+                                                        if (200..300).contains(&d_status) =>
+                                                    {
+                                                        println!(
+                                                            "Pairing: deleted request '{}'.",
+                                                            doc.name
+                                                        );
+                                                    }
+                                                    Ok((d_status, _)) => {
+                                                        println!(
+                                                            "Pairing: DELETE failed with status {}.",
+                                                            d_status
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        println!("Pairing: DELETE error: {}", e);
+                                                    }
+                                                }
+                                            }
+                                            Ok((c_status, _)) => {
+                                                println!(
+                                                    "Pairing: commit failed with status {}.",
+                                                    c_status
+                                                );
+                                            }
+                                            Err(e) => println!("Pairing: commit error: {}", e),
+                                        }
+                                    }
+                                } else {
+                                    println!("Pairing: ignoring request with mismatched PIN.");
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    println!("Pairing poll: failed to parse Firestore response.");
+                }
+            }
+            Ok((status, _)) => {
+                println!("Pairing poll: HTTP error status {}.", status);
+            }
+            Err(e) => {
+                println!("Pairing poll: request error: {}", e);
+            }
+        }
+
+        Timer::after(Duration::from_secs(PAIRING_POLL_INTERVAL_SECS)).await;
+    }
+}
+
 /// Attempts to connect as Station and acquire a DHCPv4 IP address with configured hostname.
 async fn try_connect_sta(
+    stack: Stack<'static>,
     controller: &mut WifiController<'_>,
     creds: &WifiCredentials,
-    device_name: &str,
-    seed: u64,
 ) -> bool {
     let Some(sta_cfg) = station_config_from_creds(creds) else {
         println!("Invalid stored Wi-Fi credentials format.");
@@ -661,76 +1045,57 @@ async fn try_connect_sta(
         return false;
     }
 
-    println!(
-        "Wi-Fi associated! Starting DHCP client (hostname: {})...",
-        device_name
-    );
-    let sta_iface = Interface::station();
-    let mut resources = StackResources::<4>::new();
-    let mut dhcp_cfg = DhcpConfig::default();
-    dhcp_cfg.hostname = Some(device_name.try_into().expect("valid hostname"));
+    println!("Wi-Fi associated! Waiting for DHCP lease...");
 
-    let (stack, mut runner) = embassy_net::new(
-        sta_iface,
-        embassy_net::Config::dhcpv4(dhcp_cfg),
-        &mut resources,
-        seed,
-    );
+    if with_timeout(Duration::from_secs(15), stack.wait_config_up())
+        .await
+        .is_err()
+    {
+        println!("DHCP timed out.");
+        return false;
+    }
 
-    let sta_task = async {
-        if with_timeout(Duration::from_secs(15), stack.wait_config_up())
-            .await
-            .is_err()
-        {
-            println!("DHCP timed out.");
-            return;
-        }
+    let gateway = if let Some(cfg) = stack.config_v4() {
+        println!("Acquired IP address: {}", cfg.address.address());
+        cfg.gateway
+    } else {
+        None
+    };
+    set_led_state(LedState::Connected);
 
-        let gateway = if let Some(cfg) = stack.config_v4() {
-            println!("Acquired IP address: {}", cfg.address.address());
-            cfg.gateway
-        } else {
-            None
-        };
-        set_led_state(LedState::Connected);
+    let mut icmp_rx_meta = [IcmpPacketMetadata::EMPTY; 1];
+    let mut icmp_tx_meta = [IcmpPacketMetadata::EMPTY; 1];
+    let mut icmp_rx_buf = [0u8; 128];
+    let mut icmp_tx_buf = [0u8; 128];
 
-        let mut icmp_rx_meta = [IcmpPacketMetadata::EMPTY; 1];
-        let mut icmp_tx_meta = [IcmpPacketMetadata::EMPTY; 1];
-        let mut icmp_rx_buf = [0u8; 128];
-        let mut icmp_tx_buf = [0u8; 128];
-
-        loop {
-            println!(
-                "Keep-alive: starting {}s timer before next gateway ping...",
-                KEEPALIVE_INTERVAL_SECS
+    loop {
+        println!(
+            "Keep-alive: starting {}s timer before next gateway ping...",
+            KEEPALIVE_INTERVAL_SECS
+        );
+        Timer::after(Duration::from_secs(KEEPALIVE_INTERVAL_SECS)).await;
+        if let Some(gw) = gateway {
+            println!("Keep-alive: sending ICMP ping to gateway {}...", gw);
+            let mut ping_mgr = PingManager::new(
+                stack,
+                &mut icmp_rx_meta,
+                &mut icmp_rx_buf,
+                &mut icmp_tx_meta,
+                &mut icmp_tx_buf,
             );
-            Timer::after(Duration::from_secs(KEEPALIVE_INTERVAL_SECS)).await;
-            if let Some(gw) = gateway {
-                println!("Keep-alive: sending ICMP ping to gateway {}...", gw);
-                let mut ping_mgr = PingManager::new(
-                    stack,
-                    &mut icmp_rx_meta,
-                    &mut icmp_rx_buf,
-                    &mut icmp_tx_meta,
-                    &mut icmp_tx_buf,
-                );
-                let mut params = PingParams::new(gw);
-                params.set_count(1);
-                params.set_timeout(Duration::from_secs(2));
-                match ping_mgr.ping(&params).await {
-                    Ok(rtt) => println!(
-                        "Keep-alive: ping reply from {} ({} ms).",
-                        gw,
-                        rtt.as_millis()
-                    ),
-                    Err(e) => println!("Keep-alive: ping to {} failed: {:?}", gw, e),
-                }
+            let mut params = PingParams::new(gw);
+            params.set_count(1);
+            params.set_timeout(Duration::from_secs(2));
+            match ping_mgr.ping(&params).await {
+                Ok(rtt) => println!(
+                    "Keep-alive: ping reply from {} ({} ms).",
+                    gw,
+                    rtt.as_millis()
+                ),
+                Err(e) => println!("Keep-alive: ping to {} failed: {:?}", gw, e),
             }
         }
-    };
-
-    select(runner.run(), sta_task).await;
-    false
+    }
 }
 
 /// Runs WPA2-protected SoftAP mode with optional timeout; returns submitted credentials if any.
@@ -811,7 +1176,7 @@ async fn run_captive_portal(
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
-    esp_alloc::heap_allocator!(size: 96 * 1024);
+    esp_alloc::heap_allocator!(size: 128 * 1024);
 
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
@@ -829,6 +1194,19 @@ async fn main(spawner: Spawner) {
     let mut flash = FlashStorage::new(peripherals.FLASH);
     let mut controller =
         WifiController::new(peripherals.WIFI, Default::default()).expect("Wi-Fi init failed");
+
+    let sta_resources = STA_NET_RESOURCES.init(StackResources::<6>::new());
+    let mut dhcp_cfg = DhcpConfig::default();
+    dhcp_cfg.hostname = Some(device_name.as_str().try_into().expect("valid hostname"));
+    let (sta_stack, sta_runner) = embassy_net::new(
+        Interface::station(),
+        embassy_net::Config::dhcpv4(dhcp_cfg),
+        sta_resources,
+        seed,
+    );
+    spawner.spawn(net_task(sta_runner).expect("net_task spawn"));
+    spawner.spawn(firebase_auth_task(sta_stack, seed).expect("firebase_auth_task spawn"));
+    spawner.spawn(pairing_poll_task(sta_stack, seed).expect("pairing_poll_task spawn"));
 
     println!(
         "Starting {}-second SoftAP configuration window...",
@@ -851,7 +1229,7 @@ async fn main(spawner: Spawner) {
     loop {
         if let Some(creds) = active_creds.take() {
             set_led_state(LedState::Connecting);
-            if !try_connect_sta(&mut controller, &creds, &device_name, seed).await {
+            if !try_connect_sta(sta_stack, &mut controller, &creds).await {
                 println!("STA connection failed; falling back to SoftAP provisioning.");
                 set_led_state(LedState::Error);
                 Timer::after(Duration::from_secs(2)).await;
