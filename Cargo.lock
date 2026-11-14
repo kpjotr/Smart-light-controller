@@ -9,10 +9,12 @@ dependencies = [
  "bt-hci",
  "critical-section",
  "embassy-executor",
+ "embassy-futures",
  "embassy-net",
  "embassy-time",
  "embedded-io 0.7.1",
  "embedded-io-async 0.7.0",
+ "embedded-storage",
  "esp-alloc",
  "esp-backtrace",
  "esp-bootloader-esp-idf",
@@ -21,6 +23,7 @@ dependencies = [
  "esp-println",
  "esp-radio",
  "esp-rtos",
+ "esp-storage",
  "smart-leds",
  "smoltcp 0.14.0",
  "static_cell",
@@ -1040,6 +1043,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ef0e785f54e316f64a1e14a7a2f061a2ea0b038b284902ca71e1e1f5574cf47"
 dependencies = [
  "document-features",
+ "embedded-storage",
  "esp-hal",
  "esp-hal-procmacros",
  "esp-metadata-generated",
