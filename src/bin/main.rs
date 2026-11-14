@@ -31,9 +31,6 @@ use embassy_net::{
     udp::{PacketMetadata, UdpSocket},
 };
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex as EmbassyMutex};
-use embassy_sync::{
-    blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex as EmbassyMutex,
-};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_io_async::Write as _;
 use esp_backtrace as _;
@@ -671,6 +668,7 @@ const RELAY_TICK_MS: u64 = 100;
 const SAFETY_OFF_SEC: u64 = 3600;
 const LUX_THRESHOLD: u16 = 50;
 const PIR_DURATION_SEC: u64 = 60;
+const SIMULATE_HARDWARE: bool = true;
 
 #[derive(Copy, Clone)]
 struct DeviceState {
@@ -678,6 +676,7 @@ struct DeviceState {
     lamp_turned_on_ts: Option<u64>,
     last_movement_ts: Option<u64>,
     current_lux: u16,
+    simulated_pir: bool,
 }
 
 static DEVICE_STATE: EmbassyMutex<CriticalSectionRawMutex, DeviceState> =
@@ -686,6 +685,7 @@ static DEVICE_STATE: EmbassyMutex<CriticalSectionRawMutex, DeviceState> =
         lamp_turned_on_ts: None,
         last_movement_ts: None,
         current_lux: 0,
+        simulated_pir: false,
     });
 
 #[derive(Copy, Clone)]
@@ -872,9 +872,26 @@ async fn https_request(
     }
 }
 
-/// Reads ambient light (in lux) from the BH1750 sensor over async I2C and updates `DEVICE_STATE`.
+/// Reads ambient light (in lux) from the BH1750 sensor over async I2C and updates `DEVICE_STATE`,
+/// or alternates simulated lux values between 20 and 200 every 15s when `SIMULATE_HARDWARE` is true.
 #[embassy_executor::task]
-async fn sensor_task(mut i2c: I2c<'static, Async>) -> ! {
+async fn sensor_task(i2c_opt: Option<I2c<'static, Async>>) -> ! {
+    if SIMULATE_HARDWARE {
+        let _ = i2c_opt;
+        let mut dark = true;
+        loop {
+            let lux = if dark { 20 } else { 200 };
+            {
+                let mut state = DEVICE_STATE.lock().await;
+                state.current_lux = lux;
+            }
+            println!("SIMULATOR: Lux set to {}", lux);
+            dark = !dark;
+            Timer::after(Duration::from_secs(15)).await;
+        }
+    }
+
+    let mut i2c = i2c_opt.expect("I2C must be initialized when SIMULATE_HARDWARE is false");
     let mut initialized = false;
 
     loop {
@@ -924,113 +941,53 @@ async fn sensor_task(mut i2c: I2c<'static, Async>) -> ! {
     }
 }
 
-/// Non-blocking 100 ms state machine controlling the relay on GPIO5 from PIR, lux, and PWA state.
+/// Programmatically toggles `DEVICE_STATE.simulated_pir` to exercise auto-mode transitions.
+#[allow(dead_code)]
 #[embassy_executor::task]
-async fn relay_state_machine_task(pir: Input<'static>, mut relay: Output<'static>) -> ! {
+async fn simulation_stimulus_task() -> ! {
     loop {
-        Timer::after(Duration::from_millis(RELAY_TICK_MS)).await;
-
-        let Some(current_time) = current_unix_timestamp() else {
-            continue;
-        };
-
-        let pir_active = pir.is_high();
-        let relay_is_on = relay.is_set_high();
-
-        let mut state = DEVICE_STATE.lock().await;
-
-        // [P1: Safety Override]
-        if relay_is_on
-            && state.pwa_lamp_on
-            && let Some(turned_on_ts) = state.lamp_turned_on_ts
-            && current_time.saturating_sub(turned_on_ts) > SAFETY_OFF_SEC
         {
-            relay.set_low();
-            state.pwa_lamp_on = false;
-            state.lamp_turned_on_ts = None;
-            println!("Relay: safety override triggered (OFF).");
-            continue;
+            let mut state = DEVICE_STATE.lock().await;
+            state.simulated_pir = true;
         }
-
-        // [P2: PWA Override]
-        if state.pwa_lamp_on {
-            if !relay_is_on {
-                relay.set_high();
-                state.lamp_turned_on_ts = Some(current_time);
-            }
-            continue;
-        }
-
-        // [P3: Auto Mode]
-        if !relay_is_on {
-            if pir_active && state.current_lux < LUX_THRESHOLD {
-                relay.set_high();
-                state.last_movement_ts = Some(current_time);
-                state.lamp_turned_on_ts = Some(current_time);
-            }
-        } else if pir_active {
-            state.last_movement_ts = Some(current_time);
-        } else if state
-            .last_movement_ts
-            .is_none_or(|ts| current_time.saturating_sub(ts) > PIR_DURATION_SEC)
-        {
-            relay.set_low();
-            state.lamp_turned_on_ts = None;
-        }
-    }
-}
-
-#[embassy_executor::task]
-async fn sensor_task(mut i2c: I2c<'static, Async>) -> ! {
-    let mut initialized = false;
-
-    loop {
-        if !initialized {
-            let init_ok = i2c.write_async(BH1750_ADDR_LOW, &[BH1750_CMD_POWER_ON]).await.is_ok()
-                && i2c
-                    .write_async(BH1750_ADDR_LOW, &[BH1750_CMD_CONT_HIGH_RES])
-                    .await
-                    .is_ok();
-            if init_ok {
-                initialized = true;
-                // BH1750 high-res measurement takes up to 180 ms after mode selection.
-                Timer::after(Duration::from_millis(180)).await;
-            } else {
-                println!("BH1750: I2C init failed; falling back to 0 lux.");
-                {
-                    let mut state = DEVICE_STATE.lock().await;
-                    state.current_lux = 0;
-                }
-                Timer::after(Duration::from_secs(SENSOR_POLL_INTERVAL_SECS)).await;
-                continue;
-            }
-        }
-
-        let mut buf = [0u8; 2];
-        let lux = match i2c.read_async(BH1750_ADDR_LOW, &mut buf).await {
-            Ok(()) => {
-                let raw = u16::from_be_bytes(buf);
-                ((raw as u32 * 10) / 12) as u16
-            }
-            Err(_) => {
-                println!("BH1750: I2C read failed; falling back to 0 lux.");
-                initialized = false;
-                0
-            }
-        };
+        println!("SIMULATOR: PIR active (true) for 5s");
+        Timer::after(Duration::from_secs(5)).await;
 
         {
             let mut state = DEVICE_STATE.lock().await;
-            state.current_lux = lux;
+            state.simulated_pir = false;
         }
-
-        Timer::after(Duration::from_secs(SENSOR_POLL_INTERVAL_SECS)).await;
+        println!("SIMULATOR: PIR idle (false) for 20s");
+        Timer::after(Duration::from_secs(20)).await;
     }
 }
 
-/// Non-blocking 100 ms state machine controlling the relay on GPIO5 from PIR, lux, and PWA state.
+fn set_relay_output(
+    pir_relay_opt: &mut Option<(Input<'static>, Output<'static>)>,
+    sim_relay_on: &mut bool,
+    on: bool,
+    reason: &str,
+) {
+    if SIMULATE_HARDWARE {
+        *sim_relay_on = on;
+        let state_str = if on { "ON" } else { "OFF" };
+        println!("SIMULATOR: Relay turned {} ({})", state_str, reason);
+    } else if let Some((_, relay)) = pir_relay_opt.as_mut() {
+        if on {
+            relay.set_high();
+        } else {
+            relay.set_low();
+        }
+    }
+}
+
+/// Non-blocking 100 ms state machine controlling the relay from PIR, lux, and PWA state.
 #[embassy_executor::task]
-async fn relay_state_machine_task(pir: Input<'static>, mut relay: Output<'static>) -> ! {
+async fn relay_state_machine_task(
+    mut pir_relay_opt: Option<(Input<'static>, Output<'static>)>,
+) -> ! {
+    let mut sim_relay_on = false;
+
     loop {
         Timer::after(Duration::from_millis(RELAY_TICK_MS)).await;
 
@@ -1038,10 +995,16 @@ async fn relay_state_machine_task(pir: Input<'static>, mut relay: Output<'static
             continue;
         };
 
-        let pir_active = pir.is_high();
-        let relay_is_on = relay.is_set_high();
-
         let mut state = DEVICE_STATE.lock().await;
+
+        let (pir_active, relay_is_on) = if SIMULATE_HARDWARE {
+            (state.simulated_pir, sim_relay_on)
+        } else {
+            let (pir, relay) = pir_relay_opt
+                .as_ref()
+                .expect("PIR and Relay GPIOs must be initialized when SIMULATE_HARDWARE is false");
+            (pir.is_high(), relay.is_set_high())
+        };
 
         // [P1: Safety Override]
         if relay_is_on
@@ -1049,17 +1012,21 @@ async fn relay_state_machine_task(pir: Input<'static>, mut relay: Output<'static
             && let Some(turned_on_ts) = state.lamp_turned_on_ts
             && current_time.saturating_sub(turned_on_ts) > SAFETY_OFF_SEC
         {
-            relay.set_low();
+            set_relay_output(
+                &mut pir_relay_opt,
+                &mut sim_relay_on,
+                false,
+                "Safety Override",
+            );
             state.pwa_lamp_on = false;
             state.lamp_turned_on_ts = None;
-            println!("Relay: safety override triggered (OFF).");
             continue;
         }
 
         // [P2: PWA Override]
         if state.pwa_lamp_on {
             if !relay_is_on {
-                relay.set_high();
+                set_relay_output(&mut pir_relay_opt, &mut sim_relay_on, true, "PWA Override");
                 state.lamp_turned_on_ts = Some(current_time);
             }
             continue;
@@ -1068,7 +1035,7 @@ async fn relay_state_machine_task(pir: Input<'static>, mut relay: Output<'static
         // [P3: Auto Mode]
         if !relay_is_on {
             if pir_active && state.current_lux < LUX_THRESHOLD {
-                relay.set_high();
+                set_relay_output(&mut pir_relay_opt, &mut sim_relay_on, true, "Auto Mode");
                 state.last_movement_ts = Some(current_time);
                 state.lamp_turned_on_ts = Some(current_time);
             }
@@ -1078,7 +1045,7 @@ async fn relay_state_machine_task(pir: Input<'static>, mut relay: Output<'static
             .last_movement_ts
             .is_none_or(|ts| current_time.saturating_sub(ts) > PIR_DURATION_SEC)
         {
-            relay.set_low();
+            set_relay_output(&mut pir_relay_opt, &mut sim_relay_on, false, "Auto Mode");
             state.lamp_turned_on_ts = None;
         }
     }
@@ -1536,28 +1503,24 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(led_task(peripherals.RMT, peripherals.GPIO48).expect("led_task spawn"));
 
-    let pir = Input::new(
-        peripherals.GPIO4,
-        InputConfig::default().with_pull(Pull::Down),
-    );
-    let relay = Output::new(peripherals.GPIO5, Level::Low, OutputConfig::default());
-    let i2c = I2c::new(peripherals.I2C0, I2cConfig::default())
-        .expect("I2C0 init failed")
-        .with_sda(peripherals.GPIO8)
-        .with_scl(peripherals.GPIO9)
-        .into_async();
-    spawner.spawn(sensor_task(i2c).expect("sensor_task spawn"));
-    spawner.spawn(relay_state_machine_task(pir, relay).expect("relay_state_machine_task spawn"));
-
-    let pir = Input::new(peripherals.GPIO4, InputConfig::default().with_pull(Pull::Down));
-    let relay = Output::new(peripherals.GPIO5, Level::Low, OutputConfig::default());
-    let i2c = I2c::new(peripherals.I2C0, I2cConfig::default())
-        .expect("I2C0 init failed")
-        .with_sda(peripherals.GPIO8)
-        .with_scl(peripherals.GPIO9)
-        .into_async();
-    spawner.spawn(sensor_task(i2c).expect("sensor_task spawn"));
-    spawner.spawn(relay_state_machine_task(pir, relay).expect("relay_state_machine_task spawn"));
+    let (i2c_opt, pir_relay_opt) = if SIMULATE_HARDWARE {
+        spawner.spawn(simulation_stimulus_task().expect("simulation_stimulus_task spawn"));
+        (None, None)
+    } else {
+        let pir = Input::new(
+            peripherals.GPIO4,
+            InputConfig::default().with_pull(Pull::Down),
+        );
+        let relay = Output::new(peripherals.GPIO5, Level::Low, OutputConfig::default());
+        let i2c = I2c::new(peripherals.I2C0, I2cConfig::default())
+            .expect("I2C0 init failed")
+            .with_sda(peripherals.GPIO8)
+            .with_scl(peripherals.GPIO9)
+            .into_async();
+        (Some(i2c), Some((pir, relay)))
+    };
+    spawner.spawn(sensor_task(i2c_opt).expect("sensor_task spawn"));
+    spawner.spawn(relay_state_machine_task(pir_relay_opt).expect("relay_state_machine_task spawn"));
 
     let rng = Rng::new();
     let seed = ((rng.random() as u64) << 32) | (rng.random() as u64);
