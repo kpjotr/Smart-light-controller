@@ -7,7 +7,7 @@ extern crate alloc;
 #[allow(dead_code)]
 mod secrets;
 
-use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
+use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use core::{
     cell::RefCell,
     fmt::Write as _,
@@ -74,6 +74,8 @@ const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
 const AP_BOOT_WINDOW_SECS: u64 = 60;
 const MAX_POST_BODY_BYTES: usize = 256;
 const KEEPALIVE_INTERVAL_SECS: u64 = 15;
+const CLOUD_FUNC_URL: &str = "https://verifypairing-lfmgd4eena-uc.a.run.app";
+const ESP_AUTH_TOKEN: &str = "ESP32_SECRET_TOKEN_998877";
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 #[repr(u8)]
@@ -737,13 +739,12 @@ fn current_unix_timestamp() -> Option<u64> {
 }
 
 /// Executes an async HTTPS request over `embassy_net` using `reqwless` + `embedded-tls`.
-#[allow(dead_code)]
 async fn https_request(
     stack: Stack<'static>,
     seed: u64,
     method: Method,
     url: &str,
-    bearer_token: Option<&str>,
+    extra_headers: &[(&str, &str)],
     body: Option<&[u8]>,
 ) -> Result<(u16, Vec<u8>), &'static str> {
     let tcp_state = Box::new(TcpClientState::<1, 4096, 4096>::new());
@@ -755,17 +756,13 @@ async fn https_request(
     let tls_config = TlsConfig::new(seed, &mut tls_rx, &mut tls_tx, TlsVerify::None);
     let mut client = HttpClient::new_with_tls(&tcp_client, &dns_socket, tls_config);
 
-    let auth_header = bearer_token.map(|t| format!("Bearer {}", t));
-    let mut extra_headers: [(&str, &str); 1] = [("", "")];
-
     let mut req = client
         .request(method, url)
         .await
         .map_err(|_| "HTTP request init failed")?;
 
-    if let Some(ref auth) = auth_header {
-        extra_headers[0] = ("Authorization", auth.as_str());
-        req = req.headers(&extra_headers);
+    if !extra_headers.is_empty() {
+        req = req.headers(extra_headers);
     }
 
     let mut rx_buf = vec![0u8; HTTP_RX_BUF_LEN];
@@ -794,6 +791,39 @@ async fn https_request(
             .await
             .map_err(|_| "HTTPS body read failed")?;
         Ok((status, resp_bytes.to_vec()))
+    }
+}
+
+/// Sends a single HTTPS POST pairing test request to `CLOUD_FUNC_URL` after network stabilization.
+#[embassy_executor::task]
+async fn pairing_test_task(stack: Stack<'static>, seed: u64) {
+    Timer::after(Duration::from_secs(10)).await;
+    stack.wait_config_up().await;
+
+    let headers = [("X-Esp-Auth-Token", ESP_AUTH_TOKEN)];
+    let payload = br#"{"deviceId": "SmartLight-55B8", "pin": "123456", "espUid": "ESP_MAC_123"}"#;
+
+    println!("SIMULATOR: Sending pairing POST to {}", CLOUD_FUNC_URL);
+    match https_request(
+        stack,
+        seed,
+        Method::POST,
+        CLOUD_FUNC_URL,
+        &headers,
+        Some(payload),
+    )
+    .await
+    {
+        Ok((200, _)) => println!("SIMULATOR: Pairing successful"),
+        Ok((code @ (400 | 401 | 403 | 404), _)) => {
+            println!("SIMULATOR: Pairing failed with status: {}", code);
+        }
+        Ok((code, _)) => {
+            println!("SIMULATOR: Pairing returned unexpected status: {}", code);
+        }
+        Err(e) => {
+            println!("SIMULATOR: Pairing request failed: {}", e);
+        }
     }
 }
 
@@ -1296,6 +1326,7 @@ async fn main(spawner: Spawner) {
     );
     spawner.spawn(net_task(sta_runner).expect("net_task spawn"));
     spawner.spawn(ntp_task(sta_stack).expect("ntp_task spawn"));
+    spawner.spawn(pairing_test_task(sta_stack, seed).expect("pairing_test_task spawn"));
 
     println!(
         "Starting {}-second SoftAP configuration window...",
