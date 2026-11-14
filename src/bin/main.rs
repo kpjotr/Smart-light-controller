@@ -19,7 +19,7 @@ use embassy_futures::select::{Either4, select4};
 use embassy_net::{
     DhcpConfig, IpAddress, IpEndpoint, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources,
     StaticConfigV4,
-    dns::DnsSocket,
+    dns::{DnsQueryType, DnsSocket},
     icmp::{
         PacketMetadata as IcmpPacketMetadata,
         ping::{PingManager, PingParams},
@@ -30,7 +30,7 @@ use embassy_net::{
     },
     udp::{PacketMetadata, UdpSocket},
 };
-use embassy_time::{Duration, Timer, with_timeout};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_io_async::Write as _;
 use esp_backtrace as _;
 use esp_bootloader_esp_idf::partitions::{
@@ -643,13 +643,75 @@ fn build_device_name() -> String {
     alloc::format!("SmartLight-{:02X}{:02X}", bytes[4], bytes[5])
 }
 
-static STA_NET_RESOURCES: StaticCell<StackResources<6>> = StaticCell::new();
+static STA_NET_RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
 static FIREBASE_ID_TOKEN: Mutex<RefCell<Option<String>>> = Mutex::new(RefCell::new(None));
+static NTP_TIME: Mutex<RefCell<Option<NtpSyncState>>> = Mutex::new(RefCell::new(None));
 
 const TLS_RX_BUF_LEN: usize = 16640;
 const TLS_TX_BUF_LEN: usize = 16640;
 const HTTP_RX_BUF_LEN: usize = 8192;
 const PAIRING_POLL_INTERVAL_SECS: u64 = 5;
+const NTP_SERVER: &str = "pool.ntp.org";
+const NTP_PORT: u16 = 123;
+const NTP_TO_UNIX_EPOCH: u64 = 2_208_988_800;
+const NTP_RESYNC_INTERVAL_SECS: u64 = 12 * 60 * 60;
+const NTP_RETRY_DELAY_SECS: u64 = 10;
+
+#[derive(Copy, Clone)]
+struct NtpSyncState {
+    unix_secs: u64,
+    synced_at: Instant,
+}
+
+fn set_synced_unix_time(unix_secs: u64) {
+    let synced_at = Instant::now();
+    critical_section::with(|cs| {
+        *NTP_TIME.borrow_ref_mut(cs) = Some(NtpSyncState {
+            unix_secs,
+            synced_at,
+        });
+    });
+}
+
+/// Returns the current UNIX timestamp in seconds by adding monotonic elapsed time since the
+/// last NTP sync, or `None` if NTP has not synchronized yet.
+#[allow(dead_code)]
+fn current_unix_timestamp() -> Option<u64> {
+    critical_section::with(|cs| {
+        NTP_TIME.borrow_ref(cs).map(|state| {
+            state
+                .unix_secs
+                .saturating_add(state.synced_at.elapsed().as_secs())
+        })
+    })
+}
+
+#[derive(Copy, Clone)]
+struct NtpSyncState {
+    unix_secs: u64,
+    synced_at: Instant,
+}
+
+fn set_synced_unix_time(unix_secs: u64) {
+    let synced_at = Instant::now();
+    critical_section::with(|cs| {
+        *NTP_TIME.borrow_ref_mut(cs) = Some(NtpSyncState {
+            unix_secs,
+            synced_at,
+        });
+    });
+}
+
+/// Returns the current UNIX timestamp in seconds by adding monotonic elapsed time since the
+/// last NTP sync, or `None` if NTP has not synchronized yet.
+#[allow(dead_code)]
+fn current_unix_timestamp() -> Option<u64> {
+    critical_section::with(|cs| {
+        NTP_TIME
+            .borrow_ref(cs)
+            .map(|state| state.unix_secs.saturating_add(state.synced_at.elapsed().as_secs()))
+    })
+}
 
 fn set_firebase_token(token: Option<String>) {
     critical_section::with(|cs| {
@@ -809,6 +871,79 @@ async fn https_request(
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, Interface>) -> ! {
     runner.run().await
+}
+
+/// Performs a single SNTP query against `pool.ntp.org:123` and returns the UNIX timestamp in seconds.
+async fn sync_ntp_once(stack: Stack<'static>) -> Result<u64, &'static str> {
+    let addrs = with_timeout(
+        Duration::from_secs(10),
+        stack.dns_query(NTP_SERVER, DnsQueryType::A),
+    )
+    .await
+    .map_err(|_| "DNS lookup timed out")?
+    .map_err(|_| "DNS lookup failed")?;
+
+    let server_ip = addrs.first().copied().ok_or("DNS returned no addresses")?;
+
+    let mut rx_meta = [PacketMetadata::EMPTY; 1];
+    let mut tx_meta = [PacketMetadata::EMPTY; 1];
+    let mut rx_buf = [0u8; 64];
+    let mut tx_buf = [0u8; 64];
+
+    let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
+    socket.bind(0).map_err(|_| "UDP bind failed")?;
+
+    let mut req = [0u8; 48];
+    req[0] = 0x1B; // LI = 0, VN = 3, Mode = 3 (client)
+
+    let endpoint = IpEndpoint::new(server_ip, NTP_PORT);
+    with_timeout(Duration::from_secs(5), socket.send_to(&req, endpoint))
+        .await
+        .map_err(|_| "UDP send timed out")?
+        .map_err(|_| "UDP send failed")?;
+
+    let mut resp = [0u8; 48];
+    let (len, _) = with_timeout(Duration::from_secs(5), socket.recv_from(&mut resp))
+        .await
+        .map_err(|_| "UDP recv timed out")?
+        .map_err(|_| "UDP recv failed")?;
+
+    if len < 48 {
+        return Err("SNTP response too short");
+    }
+    if (resp[0] & 0x07) != 4 || resp[1] == 0 {
+        return Err("Invalid SNTP server response");
+    }
+
+    let ntp_secs = u32::from_be_bytes([resp[40], resp[41], resp[42], resp[43]]) as u64;
+    if ntp_secs < NTP_TO_UNIX_EPOCH {
+        return Err("NTP timestamp before UNIX epoch");
+    }
+
+    Ok(ntp_secs - NTP_TO_UNIX_EPOCH)
+}
+
+/// Synchronizes system time via SNTP on startup and resynchronizes every 12 hours.
+#[embassy_executor::task]
+async fn ntp_task(stack: Stack<'static>) -> ! {
+    loop {
+        stack.wait_config_up().await;
+
+        match sync_ntp_once(stack).await {
+            Ok(unix_secs) => {
+                set_synced_unix_time(unix_secs);
+                println!("NTP: synchronized UNIX timestamp = {}", unix_secs);
+                Timer::after(Duration::from_secs(NTP_RESYNC_INTERVAL_SECS)).await;
+            }
+            Err(e) => {
+                println!(
+                    "NTP: sync failed ({}); retrying in {}s...",
+                    e, NTP_RETRY_DELAY_SECS
+                );
+                Timer::after(Duration::from_secs(NTP_RETRY_DELAY_SECS)).await;
+            }
+        }
+    }
 }
 
 /// Authenticates the device with Firebase Auth and refreshes the ID token before expiry.
@@ -1195,7 +1330,7 @@ async fn main(spawner: Spawner) {
     let mut controller =
         WifiController::new(peripherals.WIFI, Default::default()).expect("Wi-Fi init failed");
 
-    let sta_resources = STA_NET_RESOURCES.init(StackResources::<6>::new());
+    let sta_resources = STA_NET_RESOURCES.init(StackResources::<8>::new());
     let mut dhcp_cfg = DhcpConfig::default();
     dhcp_cfg.hostname = Some(device_name.as_str().try_into().expect("valid hostname"));
     let (sta_stack, sta_runner) = embassy_net::new(
@@ -1205,6 +1340,7 @@ async fn main(spawner: Spawner) {
         seed,
     );
     spawner.spawn(net_task(sta_runner).expect("net_task spawn"));
+    spawner.spawn(ntp_task(sta_stack).expect("ntp_task spawn"));
     spawner.spawn(firebase_auth_task(sta_stack, seed).expect("firebase_auth_task spawn"));
     spawner.spawn(pairing_poll_task(sta_stack, seed).expect("pairing_poll_task spawn"));
 
