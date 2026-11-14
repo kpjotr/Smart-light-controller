@@ -49,9 +49,7 @@ const CRED_MAGIC: [u8; 4] = *b"SLWC";
 const CRED_VERSION: u8 = 1;
 const CRED_RECORD_LEN: usize = 108;
 
-const AP_SSID: &str = "SmartLight-Config";
 const AP_PASSWORD: &str = "A1B2C3D4";
-const HOSTNAME: &str = "SmartLight-ESP32";
 const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
 const AP_BOOT_WINDOW_SECS: u64 = 60;
 const MAX_POST_BODY_BYTES: usize = 256;
@@ -555,7 +553,10 @@ async fn http_portal_server(
         }
 
         if payload_too_large {
-            println!("HTTP payload exceeded {} bytes; dropping connection.", MAX_POST_BODY_BYTES);
+            println!(
+                "HTTP payload exceeded {} bytes; dropping connection.",
+                MAX_POST_BODY_BYTES
+            );
             socket.close();
             continue;
         }
@@ -618,10 +619,18 @@ fn station_config_from_creds(creds: &WifiCredentials) -> Option<Config> {
     ))
 }
 
+/// Builds the dynamic device name `"SmartLight-XXXX"` from the last 2 bytes of the eFuse MAC.
+fn build_device_name() -> String {
+    let mac = esp_hal::efuse::base_mac_address();
+    let bytes = mac.as_bytes();
+    alloc::format!("SmartLight-{:02X}{:02X}", bytes[4], bytes[5])
+}
+
 /// Attempts to connect as Station and acquire a DHCPv4 IP address with configured hostname.
 async fn try_connect_sta(
     controller: &mut WifiController<'_>,
     creds: &WifiCredentials,
+    device_name: &str,
     seed: u64,
 ) -> bool {
     let Some(sta_cfg) = station_config_from_creds(creds) else {
@@ -654,12 +663,12 @@ async fn try_connect_sta(
 
     println!(
         "Wi-Fi associated! Starting DHCP client (hostname: {})...",
-        HOSTNAME
+        device_name
     );
     let sta_iface = Interface::station();
     let mut resources = StackResources::<4>::new();
     let mut dhcp_cfg = DhcpConfig::default();
-    dhcp_cfg.hostname = Some(HOSTNAME.try_into().expect("valid hostname"));
+    dhcp_cfg.hostname = Some(device_name.try_into().expect("valid hostname"));
 
     let (stack, mut runner) = embassy_net::new(
         sta_iface,
@@ -691,8 +700,13 @@ async fn try_connect_sta(
         let mut icmp_tx_buf = [0u8; 128];
 
         loop {
+            println!(
+                "Keep-alive: starting {}s timer before next gateway ping...",
+                KEEPALIVE_INTERVAL_SECS
+            );
             Timer::after(Duration::from_secs(KEEPALIVE_INTERVAL_SECS)).await;
             if let Some(gw) = gateway {
+                println!("Keep-alive: sending ICMP ping to gateway {}...", gw);
                 let mut ping_mgr = PingManager::new(
                     stack,
                     &mut icmp_rx_meta,
@@ -703,8 +717,13 @@ async fn try_connect_sta(
                 let mut params = PingParams::new(gw);
                 params.set_count(1);
                 params.set_timeout(Duration::from_secs(2));
-                if let Err(e) = ping_mgr.ping(&params).await {
-                    println!("Gateway keep-alive ping failed: {:?}", e);
+                match ping_mgr.ping(&params).await {
+                    Ok(rtt) => println!(
+                        "Keep-alive: ping reply from {} ({} ms).",
+                        gw,
+                        rtt.as_millis()
+                    ),
+                    Err(e) => println!("Keep-alive: ping to {} failed: {:?}", gw, e),
                 }
             }
         }
@@ -718,6 +737,7 @@ async fn try_connect_sta(
 async fn run_captive_portal(
     controller: &mut WifiController<'_>,
     flash: &mut FlashStorage<'_>,
+    device_name: &str,
     seed: u64,
     timeout: Option<Duration>,
 ) -> Option<WifiCredentials> {
@@ -746,7 +766,7 @@ async fn run_captive_portal(
     );
 
     let ap_cfg = AccessPointConfig::default()
-        .with_ssid(AP_SSID.try_into().expect("valid AP SSID"))
+        .with_ssid(device_name.try_into().expect("valid AP SSID"))
         .with_authentication(AuthenticationMethodConfig::Wpa2Personal(
             AP_PASSWORD.try_into().expect("valid AP password"),
         ));
@@ -765,7 +785,7 @@ async fn run_captive_portal(
 
     println!(
         "SoftAP '{}' (WPA2 pass: '{}') active at http://{}/",
-        AP_SSID, AP_PASSWORD, AP_IP
+        device_name, AP_PASSWORD, AP_IP
     );
 
     let portal_html = build_portal_html(&scanned_ssids);
@@ -803,6 +823,9 @@ async fn main(spawner: Spawner) {
     let rng = Rng::new();
     let seed = ((rng.random() as u64) << 32) | (rng.random() as u64);
 
+    let device_name = build_device_name();
+    println!("Device identity: {}", device_name);
+
     let mut flash = FlashStorage::new(peripherals.FLASH);
     let mut controller =
         WifiController::new(peripherals.WIFI, Default::default()).expect("Wi-Fi init failed");
@@ -814,6 +837,7 @@ async fn main(spawner: Spawner) {
     let mut active_creds = run_captive_portal(
         &mut controller,
         &mut flash,
+        &device_name,
         seed,
         Some(Duration::from_secs(AP_BOOT_WINDOW_SECS)),
     )
@@ -827,7 +851,7 @@ async fn main(spawner: Spawner) {
     loop {
         if let Some(creds) = active_creds.take() {
             set_led_state(LedState::Connecting);
-            if !try_connect_sta(&mut controller, &creds, seed).await {
+            if !try_connect_sta(&mut controller, &creds, &device_name, seed).await {
                 println!("STA connection failed; falling back to SoftAP provisioning.");
                 set_led_state(LedState::Error);
                 Timer::after(Duration::from_secs(2)).await;
@@ -836,6 +860,7 @@ async fn main(spawner: Spawner) {
             println!("No valid Wi-Fi credentials; starting SoftAP provisioning indefinitely.");
         }
 
-        active_creds = run_captive_portal(&mut controller, &mut flash, seed, None).await;
+        active_creds =
+            run_captive_portal(&mut controller, &mut flash, &device_name, seed, None).await;
     }
 }
