@@ -59,7 +59,6 @@ use reqwless::{
     headers::ContentType,
     request::{Method, RequestBuilder as _},
 };
-use serde::{Deserialize, Serialize};
 use smart_leds::{RGB8, SmartLedsWrite, brightness};
 use static_cell::StaticCell;
 
@@ -668,13 +667,11 @@ fn build_device_name() -> String {
 }
 
 static STA_NET_RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
-static FIREBASE_ID_TOKEN: Mutex<RefCell<Option<String>>> = Mutex::new(RefCell::new(None));
 static NTP_TIME: Mutex<RefCell<Option<NtpSyncState>>> = Mutex::new(RefCell::new(None));
 
 const TLS_RX_BUF_LEN: usize = 16640;
 const TLS_TX_BUF_LEN: usize = 16640;
 const HTTP_RX_BUF_LEN: usize = 8192;
-const PAIRING_POLL_INTERVAL_SECS: u64 = 5;
 const NTP_SERVER: &str = "pool.ntp.org";
 const NTP_PORT: u16 = 123;
 const NTP_TO_UNIX_EPOCH: u64 = 2_208_988_800;
@@ -694,8 +691,8 @@ const SIMULATE_HARDWARE: bool = true;
 struct DeviceState {
     pwa_lamp_on: bool,
     relay_on: bool,
-    lamp_turned_on_ts: Option<u64>,
-    last_movement_ts: Option<u64>,
+    lamp_turned_on_ts: Option<Instant>,
+    last_movement_ts: Option<Instant>,
     current_lux: u16,
     simulated_pir: bool,
 }
@@ -739,102 +736,8 @@ fn current_unix_timestamp() -> Option<u64> {
     })
 }
 
-fn set_firebase_token(token: Option<String>) {
-    critical_section::with(|cs| {
-        *FIREBASE_ID_TOKEN.borrow_ref_mut(cs) = token;
-    });
-}
-
-fn get_firebase_token() -> Option<String> {
-    critical_section::with(|cs| FIREBASE_ID_TOKEN.borrow_ref(cs).clone())
-}
-
-#[derive(Serialize)]
-struct SignInRequest<'a> {
-    email: &'a str,
-    password: &'a str,
-    #[serde(rename = "returnSecureToken")]
-    return_secure_token: bool,
-}
-
-#[derive(Deserialize)]
-struct SignInResponse {
-    #[serde(rename = "idToken")]
-    id_token: String,
-    #[serde(rename = "expiresIn")]
-    expires_in: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct FirestoreListResponse {
-    documents: Option<Vec<FirestoreDocument>>,
-}
-
-#[derive(Deserialize)]
-struct FirestoreDocument {
-    name: String,
-    fields: Option<PairingRequestFields>,
-}
-
-#[derive(Deserialize)]
-struct PairingRequestFields {
-    pin: Option<FirestoreValue>,
-    uid: Option<FirestoreValue>,
-}
-
-#[derive(Deserialize)]
-struct FirestoreValue {
-    #[serde(rename = "stringValue")]
-    string_value: Option<String>,
-    #[serde(rename = "integerValue")]
-    integer_value: Option<String>,
-}
-
-impl FirestoreValue {
-    fn as_str(&self) -> Option<&str> {
-        self.string_value
-            .as_deref()
-            .or(self.integer_value.as_deref())
-    }
-}
-
-#[derive(Serialize)]
-struct CommitRequest<'a> {
-    writes: [CommitWrite<'a>; 1],
-}
-
-#[derive(Serialize)]
-struct CommitWrite<'a> {
-    transform: DocumentTransform<'a>,
-}
-
-#[derive(Serialize)]
-struct DocumentTransform<'a> {
-    document: &'a str,
-    #[serde(rename = "fieldTransforms")]
-    field_transforms: [FieldTransform<'a>; 1],
-}
-
-#[derive(Serialize)]
-struct FieldTransform<'a> {
-    #[serde(rename = "fieldPath")]
-    field_path: &'a str,
-    #[serde(rename = "appendMissingElements")]
-    append_missing_elements: ArrayValue<'a>,
-}
-
-#[derive(Serialize)]
-struct ArrayValue<'a> {
-    values: [StringValue<'a>; 1],
-}
-
-#[derive(Serialize)]
-struct StringValue<'a> {
-    #[serde(rename = "stringValue")]
-    string_value: &'a str,
-}
-
 /// Executes an async HTTPS request over `embassy_net` using `reqwless` + `embedded-tls`.
+#[allow(dead_code)]
 async fn https_request(
     stack: Stack<'static>,
     seed: u64,
@@ -1010,10 +913,7 @@ async fn relay_state_machine_task(
     loop {
         Timer::after(Duration::from_millis(RELAY_TICK_MS)).await;
 
-        let Some(current_time) = current_unix_timestamp() else {
-            continue;
-        };
-
+        let now = Instant::now();
         let mut state = DEVICE_STATE.lock().await;
 
         let (pir_active, relay_is_on) = if SIMULATE_HARDWARE {
@@ -1029,10 +929,10 @@ async fn relay_state_machine_task(
         if SIMULATE_HARDWARE && tick_count.is_multiple_of(20) {
             let on_elapsed = state
                 .lamp_turned_on_ts
-                .map_or(0, |ts| current_time.saturating_sub(ts));
+                .map_or(0, |ts| ts.elapsed().as_secs());
             let idle_elapsed = state
                 .last_movement_ts
-                .map_or(0, |ts| current_time.saturating_sub(ts));
+                .map_or(0, |ts| ts.elapsed().as_secs());
             println!(
                 "SIMULATOR: status | lux={} | pir={} | relay={} | pwa={} | on_elapsed={}s | idle_elapsed={}s",
                 state.current_lux,
@@ -1048,7 +948,7 @@ async fn relay_state_machine_task(
         if relay_is_on
             && state.pwa_lamp_on
             && let Some(turned_on_ts) = state.lamp_turned_on_ts
-            && current_time.saturating_sub(turned_on_ts) > SAFETY_OFF_SEC
+            && turned_on_ts.elapsed().as_secs() > SAFETY_OFF_SEC
         {
             set_relay_output(&mut pir_relay_opt, &mut state, false);
             state.pwa_lamp_on = false;
@@ -1065,7 +965,7 @@ async fn relay_state_machine_task(
         if state.pwa_lamp_on {
             if !relay_is_on {
                 set_relay_output(&mut pir_relay_opt, &mut state, true);
-                state.lamp_turned_on_ts = Some(current_time);
+                state.lamp_turned_on_ts = Some(now);
                 println!("SIMULATOR: PWA override active -> Relay ON");
             }
             prev_pir_active = pir_active;
@@ -1076,21 +976,21 @@ async fn relay_state_machine_task(
         if !relay_is_on {
             if pir_active && state.current_lux < LUX_THRESHOLD {
                 set_relay_output(&mut pir_relay_opt, &mut state, true);
-                state.last_movement_ts = Some(current_time);
-                state.lamp_turned_on_ts = Some(current_time);
+                state.last_movement_ts = Some(now);
+                state.lamp_turned_on_ts = Some(now);
                 println!(
                     "SIMULATOR: PIR active & Lux ({}) < threshold ({}) -> Relay ON",
                     state.current_lux, LUX_THRESHOLD
                 );
             }
         } else if pir_active {
-            state.last_movement_ts = Some(current_time);
+            state.last_movement_ts = Some(now);
             if SIMULATE_HARDWARE && !prev_pir_active {
                 println!("SIMULATOR: PIR active while Relay ON -> movement timer reset");
             }
         } else if state
             .last_movement_ts
-            .is_none_or(|ts| current_time.saturating_sub(ts) > PIR_DURATION_SEC)
+            .is_none_or(|ts| ts.elapsed().as_secs() > PIR_DURATION_SEC)
         {
             set_relay_output(&mut pir_relay_opt, &mut state, false);
             state.lamp_turned_on_ts = None;
@@ -1179,206 +1079,6 @@ async fn ntp_task(stack: Stack<'static>) -> ! {
                 Timer::after(Duration::from_secs(NTP_RETRY_DELAY_SECS)).await;
             }
         }
-    }
-}
-
-/// Authenticates the device with Firebase Auth and refreshes the ID token before expiry.
-#[embassy_executor::task]
-async fn firebase_auth_task(stack: Stack<'static>, seed: u64) -> ! {
-    let url = format!(
-        "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={}",
-        secrets::FIREBASE_API_KEY
-    );
-    let payload = SignInRequest {
-        email: secrets::DEVICE_AUTH_EMAIL,
-        password: secrets::DEVICE_AUTH_PASS,
-        return_secure_token: true,
-    };
-
-    loop {
-        stack.wait_config_up().await;
-
-        let body = match serde_json::to_vec(&payload) {
-            Ok(b) => b,
-            Err(_) => {
-                println!("Firebase Auth: failed to serialize request payload.");
-                Timer::after(Duration::from_secs(30)).await;
-                continue;
-            }
-        };
-
-        println!("Firebase Auth: signing in...");
-        match https_request(stack, seed, Method::POST, &url, None, Some(&body)).await {
-            Ok((status, resp_bytes)) if (200..300).contains(&status) => {
-                match serde_json::from_slice::<SignInResponse>(&resp_bytes) {
-                    Ok(auth) => {
-                        let expires_in_secs = auth
-                            .expires_in
-                            .as_deref()
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(3600);
-                        set_firebase_token(Some(auth.id_token));
-                        println!(
-                            "Firebase Auth: authenticated (token expires in {}s).",
-                            expires_in_secs
-                        );
-                        let refresh_secs = expires_in_secs.saturating_sub(300).max(60);
-                        Timer::after(Duration::from_secs(refresh_secs)).await;
-                    }
-                    Err(_) => {
-                        println!("Firebase Auth: failed to parse JSON response.");
-                        Timer::after(Duration::from_secs(15)).await;
-                    }
-                }
-            }
-            Ok((status, _)) => {
-                println!("Firebase Auth: HTTP error status {}.", status);
-                set_firebase_token(None);
-                Timer::after(Duration::from_secs(15)).await;
-            }
-            Err(e) => {
-                println!("Firebase Auth: request error: {}", e);
-                Timer::after(Duration::from_secs(15)).await;
-            }
-        }
-    }
-}
-
-/// Polls Firestore for pairing requests, authorizes matching PINs, and deletes processed requests.
-#[embassy_executor::task]
-async fn pairing_poll_task(stack: Stack<'static>, seed: u64) -> ! {
-    let poll_url = format!(
-        "https://firestore.googleapis.com/v1/projects/{}/databases/(default)/documents/devices/{}/pairing_requests",
-        secrets::FIREBASE_PROJECT_ID,
-        secrets::DEVICE_ID
-    );
-    let commit_url = format!(
-        "https://firestore.googleapis.com/v1/projects/{}/databases/(default)/documents:commit",
-        secrets::FIREBASE_PROJECT_ID
-    );
-    let device_doc_path = format!(
-        "projects/{}/databases/(default)/documents/devices/{}",
-        secrets::FIREBASE_PROJECT_ID,
-        secrets::DEVICE_ID
-    );
-
-    loop {
-        stack.wait_config_up().await;
-
-        let Some(id_token) = get_firebase_token() else {
-            Timer::after(Duration::from_secs(2)).await;
-            continue;
-        };
-
-        match https_request(stack, seed, Method::GET, &poll_url, Some(&id_token), None).await {
-            Ok((401, _)) => {
-                println!("Pairing poll: token expired/unauthorized (401); waiting for refresh.");
-                set_firebase_token(None);
-            }
-            Ok((status, resp_bytes)) if (200..300).contains(&status) => {
-                if let Ok(list) = serde_json::from_slice::<FirestoreListResponse>(&resp_bytes) {
-                    if let Some(docs) = list.documents {
-                        for doc in docs {
-                            let Some(fields) = doc.fields else {
-                                continue;
-                            };
-                            let pin = fields.pin.as_ref().and_then(|v| v.as_str());
-                            let uid = fields.uid.as_ref().and_then(|v| v.as_str());
-
-                            if let (Some(pin), Some(uid)) = (pin, uid) {
-                                if pin == secrets::DEVICE_PIN {
-                                    println!("Pairing: valid PIN received for uid '{}'.", uid);
-                                    let commit_payload = CommitRequest {
-                                        writes: [CommitWrite {
-                                            transform: DocumentTransform {
-                                                document: &device_doc_path,
-                                                field_transforms: [FieldTransform {
-                                                    field_path: "allowedUsers",
-                                                    append_missing_elements: ArrayValue {
-                                                        values: [StringValue { string_value: uid }],
-                                                    },
-                                                }],
-                                            },
-                                        }],
-                                    };
-
-                                    if let Ok(commit_body) = serde_json::to_vec(&commit_payload) {
-                                        match https_request(
-                                            stack,
-                                            seed,
-                                            Method::POST,
-                                            &commit_url,
-                                            Some(&id_token),
-                                            Some(&commit_body),
-                                        )
-                                        .await
-                                        {
-                                            Ok((c_status, _)) if (200..300).contains(&c_status) => {
-                                                println!(
-                                                    "Pairing: added '{}' to allowedUsers.",
-                                                    uid
-                                                );
-                                                let delete_url = format!(
-                                                    "https://firestore.googleapis.com/v1/{}",
-                                                    doc.name
-                                                );
-                                                match https_request(
-                                                    stack,
-                                                    seed,
-                                                    Method::DELETE,
-                                                    &delete_url,
-                                                    Some(&id_token),
-                                                    None,
-                                                )
-                                                .await
-                                                {
-                                                    Ok((d_status, _))
-                                                        if (200..300).contains(&d_status) =>
-                                                    {
-                                                        println!(
-                                                            "Pairing: deleted request '{}'.",
-                                                            doc.name
-                                                        );
-                                                    }
-                                                    Ok((d_status, _)) => {
-                                                        println!(
-                                                            "Pairing: DELETE failed with status {}.",
-                                                            d_status
-                                                        );
-                                                    }
-                                                    Err(e) => {
-                                                        println!("Pairing: DELETE error: {}", e);
-                                                    }
-                                                }
-                                            }
-                                            Ok((c_status, _)) => {
-                                                println!(
-                                                    "Pairing: commit failed with status {}.",
-                                                    c_status
-                                                );
-                                            }
-                                            Err(e) => println!("Pairing: commit error: {}", e),
-                                        }
-                                    }
-                                } else {
-                                    println!("Pairing: ignoring request with mismatched PIN.");
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    println!("Pairing poll: failed to parse Firestore response.");
-                }
-            }
-            Ok((status, _)) => {
-                println!("Pairing poll: HTTP error status {}.", status);
-            }
-            Err(e) => {
-                println!("Pairing poll: request error: {}", e);
-            }
-        }
-
-        Timer::after(Duration::from_secs(PAIRING_POLL_INTERVAL_SECS)).await;
     }
 }
 
@@ -1596,8 +1296,6 @@ async fn main(spawner: Spawner) {
     );
     spawner.spawn(net_task(sta_runner).expect("net_task spawn"));
     spawner.spawn(ntp_task(sta_stack).expect("ntp_task spawn"));
-    spawner.spawn(firebase_auth_task(sta_stack, seed).expect("firebase_auth_task spawn"));
-    spawner.spawn(pairing_poll_task(sta_stack, seed).expect("pairing_poll_task spawn"));
 
     println!(
         "Starting {}-second SoftAP configuration window...",
