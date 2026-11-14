@@ -4,10 +4,19 @@
 extern crate alloc;
 
 use alloc::{string::String, vec::Vec};
-use core::fmt::Write as _;
+use core::{
+    fmt::Write as _,
+    sync::atomic::{AtomicU8, Ordering},
+};
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either4, select, select4};
 use embassy_net::{
-    IpAddress, IpEndpoint, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4,
+    DhcpConfig, IpAddress, IpEndpoint, Ipv4Address, Ipv4Cidr, Stack, StackResources,
+    StaticConfigV4,
+    icmp::{
+        PacketMetadata as IcmpPacketMetadata,
+        ping::{PingManager, PingParams},
+    },
     tcp::TcpSocket,
     udp::{PacketMetadata, UdpSocket},
 };
@@ -17,14 +26,21 @@ use esp_backtrace as _;
 use esp_bootloader_esp_idf::partitions::{
     DataPartitionSubType, PARTITION_TABLE_MAX_LEN, PartitionType, read_partition_table,
 };
-use esp_hal::{rng::Rng, system::software_reset, timer::timg::TimerGroup};
+use esp_hal::{
+    peripherals::{GPIO48, RMT},
+    rmt::Rmt,
+    rng::Rng,
+    time::Rate,
+    timer::timg::TimerGroup,
+};
+use esp_hal_smartled::{RmtSmartLeds, WS2812_TIMING, buffer_size, color_order};
 use esp_println::println;
 use esp_radio::wifi::{
     AuthenticationMethodConfig, Config, Interface, Ssid, WifiController, ap::AccessPointConfig,
     scan::ScanConfig, sta::StationConfig,
 };
 use esp_storage::FlashStorage;
-use static_cell::StaticCell;
+use smart_leds::{RGB8, SmartLedsWrite, brightness};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -34,14 +50,113 @@ const CRED_VERSION: u8 = 1;
 const CRED_RECORD_LEN: usize = 108;
 
 const AP_SSID: &str = "SmartLight-Config";
+const AP_PASSWORD: &str = "A1B2C3D4";
+const HOSTNAME: &str = "SmartLight-ESP32";
 const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
+const AP_BOOT_WINDOW_SECS: u64 = 60;
+const MAX_POST_BODY_BYTES: usize = 256;
+const KEEPALIVE_INTERVAL_SECS: u64 = 15;
 
-static STACK_RESOURCES: StaticCell<StackResources<6>> = StaticCell::new();
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[repr(u8)]
+enum LedState {
+    ApMode = 0,
+    Connecting = 1,
+    Connected = 2,
+    Error = 3,
+    Off = 4,
+}
+
+impl LedState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::ApMode,
+            1 => Self::Connecting,
+            2 => Self::Connected,
+            3 => Self::Error,
+            _ => Self::Off,
+        }
+    }
+}
+
+static LED_STATE: AtomicU8 = AtomicU8::new(LedState::ApMode as u8);
+
+fn set_led_state(state: LedState) {
+    LED_STATE.store(state as u8, Ordering::Relaxed);
+}
 
 #[derive(Clone)]
 struct WifiCredentials {
     ssid: String,
     password: String,
+}
+
+/// Background task driving the onboard WS2812 status LED based on `LED_STATE`.
+#[embassy_executor::task]
+async fn led_task(rmt_periph: RMT<'static>, pin: GPIO48<'static>) -> ! {
+    let rmt_freq = Rate::from_mhz(80);
+    let rmt = Rmt::new(rmt_periph, rmt_freq).expect("RMT init failed");
+    let mut led = RmtSmartLeds::<{ buffer_size::<RGB8>(1) }, _, RGB8, color_order::Grb>::new(
+        WS2812_TIMING,
+        rmt.channel0,
+        pin,
+        rmt_freq,
+    )
+    .expect("WS2812 init failed");
+
+    let mut blink_on = false;
+
+    loop {
+        let state = LedState::from_u8(LED_STATE.load(Ordering::Relaxed));
+
+        match state {
+            LedState::ApMode => {
+                blink_on = !blink_on;
+                let color = if blink_on {
+                    RGB8::new(0, 0, 255)
+                } else {
+                    RGB8::new(0, 0, 0)
+                };
+                let _ = led.write(brightness(core::iter::once(color), 30));
+                Timer::after(Duration::from_millis(300)).await;
+            }
+            LedState::Connecting => {
+                blink_on = !blink_on;
+                let color = if blink_on {
+                    RGB8::new(255, 180, 0)
+                } else {
+                    RGB8::new(0, 0, 0)
+                };
+                let _ = led.write(brightness(core::iter::once(color), 30));
+                Timer::after(Duration::from_millis(200)).await;
+            }
+            LedState::Connected => {
+                let _ = led.write(brightness(core::iter::once(RGB8::new(255, 0, 0)), 30));
+                Timer::after(Duration::from_millis(500)).await;
+                let _ = led.write(brightness(core::iter::once(RGB8::new(0, 0, 0)), 0));
+                for _ in 0..120 {
+                    if LED_STATE.load(Ordering::Relaxed) != LedState::Connected as u8 {
+                        break;
+                    }
+                    Timer::after(Duration::from_millis(250)).await;
+                }
+            }
+            LedState::Error => {
+                blink_on = !blink_on;
+                let color = if blink_on {
+                    RGB8::new(255, 0, 0)
+                } else {
+                    RGB8::new(0, 0, 0)
+                };
+                let _ = led.write(brightness(core::iter::once(color), 30));
+                Timer::after(Duration::from_millis(250)).await;
+            }
+            LedState::Off => {
+                let _ = led.write(brightness(core::iter::once(RGB8::new(0, 0, 0)), 0));
+                Timer::after(Duration::from_millis(100)).await;
+            }
+        }
+    }
 }
 
 /// Computes a 32-bit FNV-1a checksum for credential integrity verification.
@@ -120,14 +235,8 @@ fn save_credentials(flash: &mut FlashStorage<'_>, creds: &WifiCredentials) -> Re
     flash.write(offset, &buf).map_err(|_| ())
 }
 
-#[embassy_executor::task]
-async fn net_task(mut runner: Runner<'static, Interface>) -> ! {
-    runner.run().await
-}
-
 /// Minimal DHCPv4 server on UDP port 67 for SoftAP clients.
-#[embassy_executor::task]
-async fn dhcp_server_task(stack: Stack<'static>) -> ! {
+async fn dhcp_server(stack: Stack<'_>) -> ! {
     let mut rx_meta = [PacketMetadata::EMPTY; 2];
     let mut tx_meta = [PacketMetadata::EMPTY; 2];
     let mut rx_buf = [0u8; 600];
@@ -146,7 +255,6 @@ async fn dhcp_server_task(stack: Stack<'static>) -> ! {
         if len < 244 || pkt[0] != 1 {
             continue;
         }
-        // Check DHCP magic cookie 99.130.83.99
         if pkt[236..240] != [99, 130, 83, 99] {
             continue;
         }
@@ -202,28 +310,21 @@ async fn dhcp_server_task(stack: Stack<'static>) -> ! {
         resp[236..240].copy_from_slice(&[99, 130, 83, 99]); // Magic cookie
 
         let mut pos = 240;
-        // Option 53: DHCP Message Type
         resp[pos..pos + 3].copy_from_slice(&[53, 1, reply_type]);
         pos += 3;
-        // Option 54: Server Identifier
         resp[pos..pos + 2].copy_from_slice(&[54, 4]);
         resp[pos + 2..pos + 6].copy_from_slice(&AP_IP.octets());
         pos += 6;
-        // Option 51: Lease Time (3600s)
         resp[pos..pos + 6].copy_from_slice(&[51, 4, 0, 0, 0x0e, 0x10]);
         pos += 6;
-        // Option 1: Subnet Mask
         resp[pos..pos + 6].copy_from_slice(&[1, 4, 255, 255, 255, 0]);
         pos += 6;
-        // Option 3: Router
         resp[pos..pos + 2].copy_from_slice(&[3, 4]);
         resp[pos + 2..pos + 6].copy_from_slice(&AP_IP.octets());
         pos += 6;
-        // Option 6: DNS Server
         resp[pos..pos + 2].copy_from_slice(&[6, 4]);
         resp[pos + 2..pos + 6].copy_from_slice(&AP_IP.octets());
         pos += 6;
-        // Option 255: End
         resp[pos] = 255;
         pos += 1;
 
@@ -233,8 +334,7 @@ async fn dhcp_server_task(stack: Stack<'static>) -> ! {
 }
 
 /// Minimal DNS responder on UDP port 53 that resolves all queries to AP_IP for captive portal UX.
-#[embassy_executor::task]
-async fn dns_server_task(stack: Stack<'static>) -> ! {
+async fn dns_server(stack: Stack<'_>) -> ! {
     let mut rx_meta = [PacketMetadata::EMPTY; 2];
     let mut tx_meta = [PacketMetadata::EMPTY; 2];
     let mut rx_buf = [0u8; 512];
@@ -340,6 +440,22 @@ fn parse_credentials_form(body: &str) -> Option<WifiCredentials> {
     })
 }
 
+/// Escapes HTML special characters to prevent XSS in generated portal pages.
+fn html_escape(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#x27;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 /// Builds the captive portal HTML page with scanned SSIDs and manual entry fallback.
 fn build_portal_html(ssids: &[String]) -> String {
     let mut html = String::from(
@@ -354,7 +470,8 @@ fn build_portal_html(ssids: &[String]) -> String {
     if !ssids.is_empty() {
         html.push_str("<label>Available Networks</label><select name='ssid'><option value=''>-- Select network --</option>");
         for s in ssids {
-            let _ = write!(html, "<option value='{0}'>{0}</option>", s);
+            let safe_ssid = html_escape(s);
+            let _ = write!(html, "<option value='{0}'>{0}</option>", safe_ssid);
         }
         html.push_str("</select>");
     }
@@ -365,6 +482,125 @@ fn build_portal_html(ssids: &[String]) -> String {
          <button type='submit'>Save & Connect</button></form></body></html>",
     );
     html
+}
+
+/// HTTP server on port 80 that serves the portal and returns once valid credentials are saved.
+async fn http_portal_server(
+    stack: Stack<'_>,
+    flash: &mut FlashStorage<'_>,
+    portal_html: &str,
+) -> WifiCredentials {
+    let mut rx_buf = [0u8; 2048];
+    let mut tx_buf = [0u8; 2048];
+
+    loop {
+        let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
+        socket.set_timeout(Some(Duration::from_secs(10)));
+
+        if socket.accept(80).await.is_err() {
+            continue;
+        }
+
+        let mut req_buf = [0u8; 1536];
+        let mut total = 0usize;
+        let mut payload_too_large = false;
+        loop {
+            match socket.read(&mut req_buf[total..]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    total += n;
+                    if let Ok(s) = core::str::from_utf8(&req_buf[..total]) {
+                        if let Some(hdr_end) = s.find("\r\n\r\n") {
+                            let body_received = total - (hdr_end + 4);
+                            let content_len = s[..hdr_end]
+                                .lines()
+                                .find_map(|line| {
+                                    let lower_eq = line
+                                        .get(..15)
+                                        .map(|p| p.eq_ignore_ascii_case("content-length:"))
+                                        .unwrap_or(false);
+                                    if lower_eq {
+                                        line[15..].trim().parse::<usize>().ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                            if content_len > MAX_POST_BODY_BYTES
+                                || body_received > MAX_POST_BODY_BYTES
+                            {
+                                payload_too_large = true;
+                                break;
+                            }
+                            if total >= hdr_end + 4 + content_len {
+                                break;
+                            }
+                        }
+                    }
+                    if total >= req_buf.len() {
+                        payload_too_large = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if payload_too_large {
+            println!(
+                "HTTP payload exceeded {} bytes; dropping connection.",
+                MAX_POST_BODY_BYTES
+            );
+            socket.close();
+            continue;
+        }
+
+        if payload_too_large {
+            println!("HTTP payload exceeded {} bytes; dropping connection.", MAX_POST_BODY_BYTES);
+            socket.close();
+            continue;
+        }
+
+        if let Ok(req_str) = core::str::from_utf8(&req_buf[..total]) {
+            if req_str.starts_with("POST ") {
+                let body = req_str.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+                if body.len() > MAX_POST_BODY_BYTES {
+                    socket.close();
+                    continue;
+                }
+                if let Some(creds) = parse_credentials_form(body) {
+                    println!("Saving credentials for SSID '{}'...", creds.ssid);
+                    if save_credentials(flash, &creds).is_ok() {
+                        let resp_body = "<!DOCTYPE html><html><body><h2>Saved!</h2><p>Connecting to Wi-Fi...</p></body></html>";
+                        let mut hdr = String::new();
+                        let _ = write!(
+                            hdr,
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            resp_body.len()
+                        );
+                        let _ = socket.write_all(hdr.as_bytes()).await;
+                        let _ = socket.write_all(resp_body.as_bytes()).await;
+                        let _ = socket.flush().await;
+                        socket.close();
+                        Timer::after(Duration::from_millis(300)).await;
+                        return creds;
+                    }
+                }
+                let err_resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 19\r\nConnection: close\r\n\r\nInvalid credentials";
+                let _ = socket.write_all(err_resp.as_bytes()).await;
+            } else {
+                let mut hdr = String::new();
+                let _ = write!(
+                    hdr,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    portal_html.len()
+                );
+                let _ = socket.write_all(hdr.as_bytes()).await;
+                let _ = socket.write_all(portal_html.as_bytes()).await;
+            }
+            let _ = socket.flush().await;
+        }
+        socket.close();
+    }
 }
 
 /// Builds a StationConfig from saved credentials.
@@ -382,9 +618,8 @@ fn station_config_from_creds(creds: &WifiCredentials) -> Option<Config> {
     ))
 }
 
-/// Attempts to connect as Station and acquire a DHCPv4 IP address.
+/// Attempts to connect as Station and acquire a DHCPv4 IP address with configured hostname.
 async fn try_connect_sta(
-    spawner: Spawner,
     controller: &mut WifiController<'_>,
     creds: &WifiCredentials,
     seed: u64,
@@ -417,42 +652,77 @@ async fn try_connect_sta(
         return false;
     }
 
-    println!("Wi-Fi associated! Starting DHCP client...");
+    println!(
+        "Wi-Fi associated! Starting DHCP client (hostname: {})...",
+        HOSTNAME
+    );
     let sta_iface = Interface::station();
-    let resources = STACK_RESOURCES.init(StackResources::new());
-    let (stack, runner) = embassy_net::new(
+    let mut resources = StackResources::<4>::new();
+    let mut dhcp_cfg = DhcpConfig::default();
+    dhcp_cfg.hostname = Some(HOSTNAME.try_into().expect("valid hostname"));
+
+    let (stack, mut runner) = embassy_net::new(
         sta_iface,
-        embassy_net::Config::dhcpv4(Default::default()),
-        resources,
+        embassy_net::Config::dhcpv4(dhcp_cfg),
+        &mut resources,
         seed,
     );
-    spawner.spawn(net_task(runner).expect("net_task spawn"));
 
-    if with_timeout(Duration::from_secs(15), stack.wait_config_up())
-        .await
-        .is_err()
-    {
-        println!("DHCP timed out.");
-        return false;
-    }
+    let sta_task = async {
+        if with_timeout(Duration::from_secs(15), stack.wait_config_up())
+            .await
+            .is_err()
+        {
+            println!("DHCP timed out.");
+            return;
+        }
 
-    if let Some(cfg) = stack.config_v4() {
-        println!("Acquired IP address: {}", cfg.address.address());
-    }
+        let gateway = if let Some(cfg) = stack.config_v4() {
+            println!("Acquired IP address: {}", cfg.address.address());
+            cfg.gateway
+        } else {
+            None
+        };
+        set_led_state(LedState::Connected);
 
-    loop {
-        Timer::after(Duration::from_secs(10)).await;
-    }
+        let mut icmp_rx_meta = [IcmpPacketMetadata::EMPTY; 1];
+        let mut icmp_tx_meta = [IcmpPacketMetadata::EMPTY; 1];
+        let mut icmp_rx_buf = [0u8; 128];
+        let mut icmp_tx_buf = [0u8; 128];
+
+        loop {
+            Timer::after(Duration::from_secs(KEEPALIVE_INTERVAL_SECS)).await;
+            if let Some(gw) = gateway {
+                let mut ping_mgr = PingManager::new(
+                    stack,
+                    &mut icmp_rx_meta,
+                    &mut icmp_rx_buf,
+                    &mut icmp_tx_meta,
+                    &mut icmp_tx_buf,
+                );
+                let mut params = PingParams::new(gw);
+                params.set_count(1);
+                params.set_timeout(Duration::from_secs(2));
+                if let Err(e) = ping_mgr.ping(&params).await {
+                    println!("Gateway keep-alive ping failed: {:?}", e);
+                }
+            }
+        }
+    };
+
+    select(runner.run(), sta_task).await;
+    false
 }
 
-/// Runs SoftAP mode with DHCP, DNS captive-portal responder, and HTTP provisioning server.
+/// Runs WPA2-protected SoftAP mode with optional timeout; returns submitted credentials if any.
 async fn run_captive_portal(
-    spawner: Spawner,
-    mut controller: WifiController<'_>,
-    mut flash: FlashStorage<'_>,
+    controller: &mut WifiController<'_>,
+    flash: &mut FlashStorage<'_>,
     seed: u64,
-) -> ! {
-    // Scan nearby networks in STA mode before switching to SoftAP.
+    timeout: Option<Duration>,
+) -> Option<WifiCredentials> {
+    set_led_state(LedState::ApMode);
+
     let mut scanned_ssids: Vec<String> = Vec::new();
     if controller
         .set_config(&Config::Station(StationConfig::default()))
@@ -477,109 +747,45 @@ async fn run_captive_portal(
 
     let ap_cfg = AccessPointConfig::default()
         .with_ssid(AP_SSID.try_into().expect("valid AP SSID"))
-        .with_authentication(AuthenticationMethodConfig::Open);
+        .with_authentication(AuthenticationMethodConfig::Wpa2Personal(
+            AP_PASSWORD.try_into().expect("valid AP password"),
+        ));
     controller
         .set_config(&Config::AccessPoint(ap_cfg))
         .expect("Failed to start SoftAP");
 
     let ap_iface = Interface::access_point();
-    let resources = STACK_RESOURCES.init(StackResources::new());
+    let mut resources = StackResources::<6>::new();
     let net_cfg = embassy_net::Config::ipv4_static(StaticConfigV4 {
         address: Ipv4Cidr::new(AP_IP, 24),
         gateway: Some(AP_IP),
         dns_servers: Default::default(),
     });
-    let (stack, runner) = embassy_net::new(ap_iface, net_cfg, resources, seed);
+    let (stack, mut runner) = embassy_net::new(ap_iface, net_cfg, &mut resources, seed);
 
-    spawner.spawn(net_task(runner).expect("net_task spawn"));
-    spawner.spawn(dhcp_server_task(stack).expect("dhcp_server_task spawn"));
-    spawner.spawn(dns_server_task(stack).expect("dns_server_task spawn"));
-
-    println!("SoftAP '{}' active at http://{}/", AP_SSID, AP_IP);
+    println!(
+        "SoftAP '{}' (WPA2 pass: '{}') active at http://{}/",
+        AP_SSID, AP_PASSWORD, AP_IP
+    );
 
     let portal_html = build_portal_html(&scanned_ssids);
-    let mut rx_buf = [0u8; 2048];
-    let mut tx_buf = [0u8; 2048];
 
-    loop {
-        let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
-        socket.set_timeout(Some(Duration::from_secs(10)));
+    let portal_future = select4(
+        runner.run(),
+        dhcp_server(stack),
+        dns_server(stack),
+        http_portal_server(stack, flash, &portal_html),
+    );
 
-        if socket.accept(80).await.is_err() {
-            continue;
-        }
-
-        let mut req_buf = [0u8; 1536];
-        let mut total = 0usize;
-        loop {
-            match socket.read(&mut req_buf[total..]).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    total += n;
-                    if total >= req_buf.len() {
-                        break;
-                    }
-                    if let Ok(s) = core::str::from_utf8(&req_buf[..total]) {
-                        if let Some(hdr_end) = s.find("\r\n\r\n") {
-                            let content_len = s[..hdr_end]
-                                .lines()
-                                .find_map(|line| {
-                                    let lower_eq = line
-                                        .get(..15)
-                                        .map(|p| p.eq_ignore_ascii_case("content-length:"))
-                                        .unwrap_or(false);
-                                    if lower_eq {
-                                        line[15..].trim().parse::<usize>().ok()
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or(0);
-                            if total >= hdr_end + 4 + content_len {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Ok(req_str) = core::str::from_utf8(&req_buf[..total]) {
-            if req_str.starts_with("POST ") {
-                let body = req_str.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
-                if let Some(creds) = parse_credentials_form(body) {
-                    println!("Saving credentials for SSID '{}'...", creds.ssid);
-                    if save_credentials(&mut flash, &creds).is_ok() {
-                        let resp_body = "<!DOCTYPE html><html><body><h2>Saved!</h2><p>Rebooting to connect...</p></body></html>";
-                        let mut hdr = String::new();
-                        let _ = write!(
-                            hdr,
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            resp_body.len()
-                        );
-                        let _ = socket.write_all(hdr.as_bytes()).await;
-                        let _ = socket.write_all(resp_body.as_bytes()).await;
-                        let _ = socket.flush().await;
-                        socket.close();
-                        Timer::after(Duration::from_millis(500)).await;
-                        software_reset();
-                    }
-                }
-                let err_resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 19\r\nConnection: close\r\n\r\nInvalid credentials";
-                let _ = socket.write_all(err_resp.as_bytes()).await;
-            } else {
-                let mut hdr = String::new();
-                let _ = write!(
-                    hdr,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    portal_html.len()
-                );
-                let _ = socket.write_all(hdr.as_bytes()).await;
-                let _ = socket.write_all(portal_html.as_bytes()).await;
-            }
-            let _ = socket.flush().await;
-        }
-        socket.close();
+    match timeout {
+        Some(dur) => match with_timeout(dur, portal_future).await {
+            Ok(Either4::Fourth(creds)) => Some(creds),
+            _ => None,
+        },
+        None => match portal_future.await {
+            Either4::Fourth(creds) => Some(creds),
+            _ => None,
+        },
     }
 }
 
@@ -592,6 +798,8 @@ async fn main(spawner: Spawner) {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
+    spawner.spawn(led_task(peripherals.RMT, peripherals.GPIO48).expect("led_task spawn"));
+
     let rng = Rng::new();
     let seed = ((rng.random() as u64) << 32) | (rng.random() as u64);
 
@@ -599,15 +807,35 @@ async fn main(spawner: Spawner) {
     let mut controller =
         WifiController::new(peripherals.WIFI, Default::default()).expect("Wi-Fi init failed");
 
-    if let Some(creds) = load_credentials(&mut flash) {
-        println!("Found saved Wi-Fi credentials for '{}'.", creds.ssid);
-        if try_connect_sta(spawner, &mut controller, &creds, seed).await {
-            return;
-        }
-        println!("STA connection failed; falling back to SoftAP provisioning.");
-    } else {
-        println!("No saved Wi-Fi credentials found; starting SoftAP provisioning.");
+    println!(
+        "Starting {}-second SoftAP configuration window...",
+        AP_BOOT_WINDOW_SECS
+    );
+    let mut active_creds = run_captive_portal(
+        &mut controller,
+        &mut flash,
+        seed,
+        Some(Duration::from_secs(AP_BOOT_WINDOW_SECS)),
+    )
+    .await;
+
+    if active_creds.is_none() {
+        println!("60s AP window expired; checking NVS for saved credentials...");
+        active_creds = load_credentials(&mut flash);
     }
 
-    run_captive_portal(spawner, controller, flash, seed).await;
+    loop {
+        if let Some(creds) = active_creds.take() {
+            set_led_state(LedState::Connecting);
+            if !try_connect_sta(&mut controller, &creds, seed).await {
+                println!("STA connection failed; falling back to SoftAP provisioning.");
+                set_led_state(LedState::Error);
+                Timer::after(Duration::from_secs(2)).await;
+            }
+        } else {
+            println!("No valid Wi-Fi credentials; starting SoftAP provisioning indefinitely.");
+        }
+
+        active_creds = run_captive_portal(&mut controller, &mut flash, seed, None).await;
+    }
 }

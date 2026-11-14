@@ -1,6 +1,6 @@
 [package]
 edition      = "2024"
-name         = "Smart-light-controller"
+name         = "smart-light-controller"
 rust-version = "1.95"
 version      = "0.1.0"
 
@@ -23,6 +23,7 @@ esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3"] }
 embassy-net = { version = "0.9.1", features = [
   "dhcpv4",
   "dhcpv4-hostname",
+  "icmp",
   "medium-ethernet",
   "tcp",
   "udp",
