@@ -150,14 +150,34 @@ async fn led_task(rmt_periph: RMT<'static>, pin: GPIO48<'static>) -> ! {
                 Timer::after(Duration::from_millis(200)).await;
             }
             LedState::Connected => {
-                let _ = led.write(brightness(core::iter::once(RGB8::new(255, 0, 0)), 30));
-                Timer::after(Duration::from_millis(500)).await;
-                let _ = led.write(brightness(core::iter::once(RGB8::new(0, 0, 0)), 0));
-                for _ in 0..120 {
-                    if LED_STATE.load(Ordering::Relaxed) != LedState::Connected as u8 {
-                        break;
+                if SIMULATE_HARDWARE {
+                    let mut last_relay_on: Option<bool> = None;
+                    while LED_STATE.load(Ordering::Relaxed) == LedState::Connected as u8 {
+                        let relay_on = {
+                            let state = DEVICE_STATE.lock().await;
+                            state.relay_on
+                        };
+                        if last_relay_on != Some(relay_on) {
+                            let color = if relay_on {
+                                RGB8::new(50, 50, 50)
+                            } else {
+                                RGB8::new(0, 0, 0)
+                            };
+                            let _ = led.write(core::iter::once(color));
+                            last_relay_on = Some(relay_on);
+                        }
+                        Timer::after(Duration::from_millis(100)).await;
                     }
-                    Timer::after(Duration::from_millis(250)).await;
+                } else {
+                    let _ = led.write(brightness(core::iter::once(RGB8::new(255, 0, 0)), 30));
+                    Timer::after(Duration::from_millis(500)).await;
+                    let _ = led.write(brightness(core::iter::once(RGB8::new(0, 0, 0)), 0));
+                    for _ in 0..120 {
+                        if LED_STATE.load(Ordering::Relaxed) != LedState::Connected as u8 {
+                            break;
+                        }
+                        Timer::after(Duration::from_millis(250)).await;
+                    }
                 }
             }
             LedState::Error => {
@@ -673,6 +693,7 @@ const SIMULATE_HARDWARE: bool = true;
 #[derive(Copy, Clone)]
 struct DeviceState {
     pwa_lamp_on: bool,
+    relay_on: bool,
     lamp_turned_on_ts: Option<u64>,
     last_movement_ts: Option<u64>,
     current_lux: u16,
@@ -682,6 +703,7 @@ struct DeviceState {
 static DEVICE_STATE: EmbassyMutex<CriticalSectionRawMutex, DeviceState> =
     EmbassyMutex::new(DeviceState {
         pwa_lamp_on: false,
+        relay_on: false,
         lamp_turned_on_ts: None,
         last_movement_ts: None,
         current_lux: 0,
@@ -950,29 +972,25 @@ async fn simulation_stimulus_task() -> ! {
             let mut state = DEVICE_STATE.lock().await;
             state.simulated_pir = true;
         }
-        println!("SIMULATOR: PIR active (true) for 5s");
+        println!("SIMULATOR: Stimulus toggled PIR to true (active for 5s)");
         Timer::after(Duration::from_secs(5)).await;
 
         {
             let mut state = DEVICE_STATE.lock().await;
             state.simulated_pir = false;
         }
-        println!("SIMULATOR: PIR idle (false) for 20s");
+        println!("SIMULATOR: Stimulus toggled PIR to false (idle for 20s)");
         Timer::after(Duration::from_secs(20)).await;
     }
 }
 
 fn set_relay_output(
     pir_relay_opt: &mut Option<(Input<'static>, Output<'static>)>,
-    sim_relay_on: &mut bool,
+    state: &mut DeviceState,
     on: bool,
-    reason: &str,
 ) {
-    if SIMULATE_HARDWARE {
-        *sim_relay_on = on;
-        let state_str = if on { "ON" } else { "OFF" };
-        println!("SIMULATOR: Relay turned {} ({})", state_str, reason);
-    } else if let Some((_, relay)) = pir_relay_opt.as_mut() {
+    state.relay_on = on;
+    if !SIMULATE_HARDWARE && let Some((_, relay)) = pir_relay_opt.as_mut() {
         if on {
             relay.set_high();
         } else {
@@ -986,7 +1004,8 @@ fn set_relay_output(
 async fn relay_state_machine_task(
     mut pir_relay_opt: Option<(Input<'static>, Output<'static>)>,
 ) -> ! {
-    let mut sim_relay_on = false;
+    let mut tick_count: u32 = 0;
+    let mut prev_pir_active = false;
 
     loop {
         Timer::after(Duration::from_millis(RELAY_TICK_MS)).await;
@@ -998,7 +1017,7 @@ async fn relay_state_machine_task(
         let mut state = DEVICE_STATE.lock().await;
 
         let (pir_active, relay_is_on) = if SIMULATE_HARDWARE {
-            (state.simulated_pir, sim_relay_on)
+            (state.simulated_pir, state.relay_on)
         } else {
             let (pir, relay) = pir_relay_opt
                 .as_ref()
@@ -1006,48 +1025,82 @@ async fn relay_state_machine_task(
             (pir.is_high(), relay.is_set_high())
         };
 
+        tick_count = tick_count.wrapping_add(1);
+        if SIMULATE_HARDWARE && tick_count.is_multiple_of(20) {
+            let on_elapsed = state
+                .lamp_turned_on_ts
+                .map_or(0, |ts| current_time.saturating_sub(ts));
+            let idle_elapsed = state
+                .last_movement_ts
+                .map_or(0, |ts| current_time.saturating_sub(ts));
+            println!(
+                "SIMULATOR: status | lux={} | pir={} | relay={} | pwa={} | on_elapsed={}s | idle_elapsed={}s",
+                state.current_lux,
+                pir_active,
+                relay_is_on,
+                state.pwa_lamp_on,
+                on_elapsed,
+                idle_elapsed
+            );
+        }
+
         // [P1: Safety Override]
         if relay_is_on
             && state.pwa_lamp_on
             && let Some(turned_on_ts) = state.lamp_turned_on_ts
             && current_time.saturating_sub(turned_on_ts) > SAFETY_OFF_SEC
         {
-            set_relay_output(
-                &mut pir_relay_opt,
-                &mut sim_relay_on,
-                false,
-                "Safety Override",
-            );
+            set_relay_output(&mut pir_relay_opt, &mut state, false);
             state.pwa_lamp_on = false;
             state.lamp_turned_on_ts = None;
+            println!(
+                "SIMULATOR: Safety timeout ({}s) reached -> Relay OFF",
+                SAFETY_OFF_SEC
+            );
+            prev_pir_active = pir_active;
             continue;
         }
 
         // [P2: PWA Override]
         if state.pwa_lamp_on {
             if !relay_is_on {
-                set_relay_output(&mut pir_relay_opt, &mut sim_relay_on, true, "PWA Override");
+                set_relay_output(&mut pir_relay_opt, &mut state, true);
                 state.lamp_turned_on_ts = Some(current_time);
+                println!("SIMULATOR: PWA override active -> Relay ON");
             }
+            prev_pir_active = pir_active;
             continue;
         }
 
         // [P3: Auto Mode]
         if !relay_is_on {
             if pir_active && state.current_lux < LUX_THRESHOLD {
-                set_relay_output(&mut pir_relay_opt, &mut sim_relay_on, true, "Auto Mode");
+                set_relay_output(&mut pir_relay_opt, &mut state, true);
                 state.last_movement_ts = Some(current_time);
                 state.lamp_turned_on_ts = Some(current_time);
+                println!(
+                    "SIMULATOR: PIR active & Lux ({}) < threshold ({}) -> Relay ON",
+                    state.current_lux, LUX_THRESHOLD
+                );
             }
         } else if pir_active {
             state.last_movement_ts = Some(current_time);
+            if SIMULATE_HARDWARE && !prev_pir_active {
+                println!("SIMULATOR: PIR active while Relay ON -> movement timer reset");
+            }
         } else if state
             .last_movement_ts
             .is_none_or(|ts| current_time.saturating_sub(ts) > PIR_DURATION_SEC)
         {
-            set_relay_output(&mut pir_relay_opt, &mut sim_relay_on, false, "Auto Mode");
+            set_relay_output(&mut pir_relay_opt, &mut state, false);
             state.lamp_turned_on_ts = None;
+            println!(
+                "SIMULATOR: PIR timeout ({}s) reached -> Relay OFF",
+                PIR_DURATION_SEC
+            );
         }
+
+        prev_pir_active = pir_active;
     }
 }
 
