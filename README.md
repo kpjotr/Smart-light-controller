@@ -13,7 +13,7 @@ Ipari megbízhatóságú, **100%-ban offline-tűrő (offline-resilient)** okos v
 - **100% Offline-Resilient Alapműködés:** Az eszköz a tápfeszültség ráadása után – érvényes NVS konfiguráció esetén – **Wi-Fi kapcsolat és NTP időszinkron nélkül is azonnal működik**. A belső állapotgép időzítései (`embassy_time::Instant`) teljesen függetlenek a hálózati állapottól.
 - **Hardveres Azonosítás & Egységes Kriptográfiai Kulcs:**
   - Az eszköz neve és Access Point (AP) SSID-ja automatikusan az ESP32 egyedi hardveres **MAC címéből** generálódik (`SmartLight-XXXX`).
-  - Gyártáskor minden eszköz egy kriptográfiailag biztonságos, egyedi, fix hosszúságú **Biztonsági Kódot (Passkey)** kap, amely egyszerre szolgál az **AP WPA2-PSK jelszavaként** és a **PWA felhős párosítási kódjaként**.
+  - Gyártáskor minden eszköz egy kriptográfiailag biztonságos, egyedi, 10 karakteres **Biztonsági Kódot (`FACTORY_PASSKEY`)** kap, amely egyszerre szolgál az **AP WPA2-PSK jelszavaként** és a **PWA felhős párosítási kódjaként**.
   - A Captive Portal kizárólag a WPA2-védett AP-hoz történő csatlakozás után érhető el.
 - **Verify-Before-Save Wi-Fi Tárolás:** A megadott helyi Wi-Fi adatokat (maximum 1 db SSID + PW páros, az új mindig felülírja a régit) a vezérlő **kizárólag sikeres Wi-Fi csatlakozás után** menti el az NVS flash memóriába, így kizárt a hibás/elgépelt hálózati adatok rögzítése.
 - **Könnyűsúlyú Felhő Kommunikáció:** A memóriazabáló kliensoldali Firebase Auth és Firestore REST API hívások helyett az ESP32 biztonságos **HTTPS POST** kérésekkel (`reqwless` + `embedded-tls`) kommunikál a Firebase Cloud Functions v2 végpontokkal.
@@ -44,7 +44,7 @@ Az állapotgép (`relay_state_machine_task`) három prioritási szinten kezeli a
    - Felülbírálja a P3 szenzoros automatikát.
 3. **P3 – Szenzoros Automatika (PIR + BH1750 Lux):**
    - Ha a mért környezeti fényerő a beállított küszöbérték (`threshold`) alatt van, és a PIR szenzor mozgást érzékel (a `sensitivity` és `delay` figyelembevételével), a relé behúz.
-   - A lámpa a mozgás megszűnése után kizárólag a beállított **`duration` (`PIR_DURATION_SEC`)** időzítő szerint kapcsol le (nem a `SAFETY_OFF_SEC` alapján).
+   - A lámpa a mozgás megszűnése után kizárólag a beállított **`duration`** (másodpercben megadott PIR időzítő) szerint kapcsol le (nem a `SAFETY_OFF_SEC` alapján).
 
 ---
 
@@ -104,3 +104,4 @@ A Captive Portal felülete **kizárólag az eszköz WPA2-védett AP hálózatáh
 ```bash
 # Fordítás és flashelés (ESP32-S3)
 cargo run --release
+```

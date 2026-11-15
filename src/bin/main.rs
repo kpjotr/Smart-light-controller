@@ -69,9 +69,11 @@ const CRED_MAGIC: [u8; 4] = *b"SLWC";
 const CRED_VERSION: u8 = 1;
 const CRED_RECORD_LEN: usize = 108;
 
-const AP_PASSWORD: &str = "A1B2C3D4";
+const FACTORY_PASSKEY: &str = "K7M9P2X4R8";
 const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
 const AP_BOOT_WINDOW_SECS: u64 = 60;
+const PAIRING_WINDOW_SECS: u64 = 300;
+const PAIRING_RETRY_INTERVAL_SECS: u64 = 10;
 const MAX_POST_BODY_BYTES: usize = 256;
 const KEEPALIVE_INTERVAL_SECS: u64 = 15;
 const CLOUD_FUNC_URL: &str = "https://verifypairing-lfmgd4eena-uc.a.run.app";
@@ -156,7 +158,7 @@ async fn led_task(rmt_periph: RMT<'static>, pin: GPIO48<'static>) -> ! {
                     while LED_STATE.load(Ordering::Relaxed) == LedState::Connected as u8 {
                         let relay_on = {
                             let state = DEVICE_STATE.lock().await;
-                            state.relay_on
+                            state.lamp_is_on
                         };
                         if last_relay_on != Some(relay_on) {
                             let color = if relay_on {
@@ -668,6 +670,16 @@ fn build_device_name() -> String {
     alloc::format!("SmartLight-{:02X}{:02X}", bytes[4], bytes[5])
 }
 
+/// Builds the full hardware MAC UID string in uppercase hex for cloud pairing (`espUid`).
+fn build_esp_uid() -> String {
+    let mac = esp_hal::efuse::base_mac_address();
+    let bytes = mac.as_bytes();
+    alloc::format!(
+        "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+    )
+}
+
 static STA_NET_RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
 static NTP_TIME: Mutex<RefCell<Option<NtpSyncState>>> = Mutex::new(RefCell::new(None));
 
@@ -685,25 +697,49 @@ const BH1750_CMD_CONT_HIGH_RES: u8 = 0x10;
 const SENSOR_POLL_INTERVAL_SECS: u64 = 1;
 const RELAY_TICK_MS: u64 = 100;
 const SAFETY_OFF_SEC: u64 = 3600;
-const LUX_THRESHOLD: u16 = 50;
-const PIR_DURATION_SEC: u64 = 60;
 const SIMULATE_HARDWARE: bool = true;
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum LampOnSource {
+    None,
+    ManualP2,
+    SensorP3,
+}
 
 #[derive(Copy, Clone)]
 struct DeviceState {
-    pwa_lamp_on: bool,
-    relay_on: bool,
-    lamp_turned_on_ts: Option<Instant>,
+    threshold: u16,
+    duration: u64,
+    sensitivity: u8,
+    delay: u16,
+    safety_off_sec: u64,
+    remote_lamp_on: bool,
+    lamp_is_on: bool,
+    lamp_on_source: LampOnSource,
+    p2_turned_on_at: Option<Instant>,
     last_movement_ts: Option<Instant>,
     current_lux: u16,
     simulated_pir: bool,
 }
 
+impl DeviceState {
+    /// Returns `true` only when all four core configuration parameters are non-zero.
+    fn is_configured(&self) -> bool {
+        self.threshold != 0 && self.duration != 0 && self.sensitivity != 0 && self.delay != 0
+    }
+}
+
 static DEVICE_STATE: EmbassyMutex<CriticalSectionRawMutex, DeviceState> =
     EmbassyMutex::new(DeviceState {
-        pwa_lamp_on: false,
-        relay_on: false,
-        lamp_turned_on_ts: None,
+        threshold: 0,
+        duration: 0,
+        sensitivity: 0,
+        delay: 0,
+        safety_off_sec: SAFETY_OFF_SEC,
+        remote_lamp_on: false,
+        lamp_is_on: false,
+        lamp_on_source: LampOnSource::None,
+        p2_turned_on_at: None,
         last_movement_ts: None,
         current_lux: 0,
         simulated_pir: false,
@@ -794,55 +830,90 @@ async fn https_request(
     }
 }
 
-/// Sends a single HTTPS POST pairing test request to `CLOUD_FUNC_URL` after network stabilization.
+/// Attempts cloud pairing against `CLOUD_FUNC_URL` for up to 5 minutes after Wi-Fi is connected.
 #[embassy_executor::task]
 async fn pairing_test_task(stack: Stack<'static>, seed: u64) {
-    Timer::after(Duration::from_secs(10)).await;
     stack.wait_config_up().await;
 
+    let window_start = Instant::now();
+    let window_duration = Duration::from_secs(PAIRING_WINDOW_SECS);
+    let device_id = build_device_name();
+    let esp_uid = build_esp_uid();
     let headers = [("X-Esp-Auth-Token", ESP_AUTH_TOKEN)];
-    let payload = br#"{"deviceId": "SmartLight-55B8", "pin": "123456", "espUid": "ESP_MAC_123"}"#;
+    let payload = alloc::format!(
+        r#"{{"deviceId": "{}", "pin": "{}", "espUid": "{}"}}"#,
+        device_id, FACTORY_PASSKEY, esp_uid
+    );
 
-    println!("SIMULATOR: Sending pairing POST to {}", CLOUD_FUNC_URL);
-    match https_request(
-        stack,
-        seed,
-        Method::POST,
-        CLOUD_FUNC_URL,
-        &headers,
-        Some(payload),
-    )
-    .await
-    {
-        Ok((200, _)) => println!("SIMULATOR: Pairing successful"),
-        Ok((code @ (400 | 401 | 403 | 404), _)) => {
-            println!("SIMULATOR: Pairing failed with status: {}", code);
+    println!(
+        "PAIRING: 5-minute pairing window opened for {} (espUid={})",
+        device_id, esp_uid
+    );
+
+    loop {
+        let elapsed = window_start.elapsed();
+        if elapsed >= window_duration {
+            break;
         }
-        Ok((code, _)) => {
-            println!("SIMULATOR: Pairing returned unexpected status: {}", code);
+
+        println!("PAIRING: Sending verifyPairing POST to {}", CLOUD_FUNC_URL);
+        match https_request(
+            stack,
+            seed,
+            Method::POST,
+            CLOUD_FUNC_URL,
+            &headers,
+            Some(payload.as_bytes()),
+        )
+        .await
+        {
+            Ok((200, _)) => {
+                println!(
+                    "PAIRING: Pairing successful (HTTP 200) for {}; closing pairing window.",
+                    device_id
+                );
+                return;
+            }
+            Ok((code @ (400 | 401 | 403 | 404), _)) => {
+                println!("PAIRING: verifyPairing returned status: {}", code);
+            }
+            Ok((code, _)) => {
+                println!("PAIRING: verifyPairing returned unexpected status: {}", code);
+            }
+            Err(e) => {
+                println!("PAIRING: verifyPairing request failed: {}", e);
+            }
         }
-        Err(e) => {
-            println!("SIMULATOR: Pairing request failed: {}", e);
+
+        let Some(remaining) = window_duration.checked_sub(window_start.elapsed()) else {
+            break;
+        };
+        if remaining.as_millis() == 0 {
+            break;
         }
+        let retry_delay = Duration::from_secs(PAIRING_RETRY_INTERVAL_SECS);
+        Timer::after(if remaining < retry_delay {
+            remaining
+        } else {
+            retry_delay
+        })
+        .await;
     }
+
+    println!(
+        "PAIRING: 5-minute pairing window closed for {} without HTTP 200 (re-open via Hard Reset or PWA/Portal Restart).",
+        device_id
+    );
 }
 
-/// Reads ambient light (in lux) from the BH1750 sensor over async I2C and updates `DEVICE_STATE`,
-/// or alternates simulated lux values between 20 and 200 every 15s when `SIMULATE_HARDWARE` is true.
+/// Reads ambient light (in lux) from the BH1750 sensor over async I2C and updates `DEVICE_STATE`.
+/// When `SIMULATE_HARDWARE` is true, `simulation_stimulus_task` drives `current_lux` directly.
 #[embassy_executor::task]
 async fn sensor_task(i2c_opt: Option<I2c<'static, Async>>) -> ! {
     if SIMULATE_HARDWARE {
         let _ = i2c_opt;
-        let mut dark = true;
         loop {
-            let lux = if dark { 20 } else { 200 };
-            {
-                let mut state = DEVICE_STATE.lock().await;
-                state.current_lux = lux;
-            }
-            println!("SIMULATOR: Lux set to {}", lux);
-            dark = !dark;
-            Timer::after(Duration::from_secs(15)).await;
+            Timer::after(Duration::from_secs(3600)).await;
         }
     }
 
@@ -896,24 +967,167 @@ async fn sensor_task(i2c_opt: Option<I2c<'static, Async>>) -> ! {
     }
 }
 
-/// Programmatically toggles `DEVICE_STATE.simulated_pir` to exercise auto-mode transitions.
+/// Deterministically exercises all P1/P2/P3 switching priorities, boot gate, and timers.
 #[allow(dead_code)]
 #[embassy_executor::task]
 async fn simulation_stimulus_task() -> ! {
-    loop {
-        {
-            let mut state = DEVICE_STATE.lock().await;
-            state.simulated_pir = true;
-        }
-        println!("SIMULATOR: Stimulus toggled PIR to true (active for 5s)");
-        Timer::after(Duration::from_secs(5)).await;
+    // Allow initial startup logs to settle before beginning the verification sequence.
+    Timer::after(Duration::from_secs(1)).await;
 
-        {
-            let mut state = DEVICE_STATE.lock().await;
-            state.simulated_pir = false;
-        }
-        println!("SIMULATOR: Stimulus toggled PIR to false (idle for 20s)");
-        Timer::after(Duration::from_secs(20)).await;
+    // Step 0: Unconfigured Boot Gate Test (threshold == 0 -> relay must stay OFF)
+    println!("[SIM STEP 0] Unconfigured Boot Gate Test: threshold=0, lux=10, pir=true");
+    {
+        let mut state = DEVICE_STATE.lock().await;
+        state.threshold = 0;
+        state.duration = 4;
+        state.sensitivity = 50;
+        state.delay = 10;
+        state.safety_off_sec = 6;
+        state.remote_lamp_on = false;
+        state.current_lux = 10;
+        state.simulated_pir = true;
+    }
+    Timer::after(Duration::from_secs(1)).await;
+    {
+        let mut state = DEVICE_STATE.lock().await;
+        assert!(
+            !state.lamp_is_on && state.lamp_on_source == LampOnSource::None,
+            "[SIM STEP 0] FAIL: Relay turned ON while unconfigured"
+        );
+        state.simulated_pir = false;
+    }
+    println!("[SIM STEP 0] PASS: Relay stayed OFF while device is unconfigured.");
+
+    // Step 1: Configured + Daylight Motion Blocked (lux >= threshold)
+    println!("[SIM STEP 1] Configured + Daylight Motion Blocked: threshold=100, lux=250, pir=true");
+    {
+        let mut state = DEVICE_STATE.lock().await;
+        state.threshold = 100;
+        state.duration = 4;
+        state.sensitivity = 50;
+        state.delay = 10;
+        state.current_lux = 250;
+        state.simulated_pir = true;
+    }
+    Timer::after(Duration::from_secs(2)).await;
+    {
+        let mut state = DEVICE_STATE.lock().await;
+        assert!(
+            !state.lamp_is_on && state.lamp_on_source == LampOnSource::None,
+            "[SIM STEP 1] FAIL: Relay turned ON in daylight (lux >= threshold)"
+        );
+        state.simulated_pir = false;
+    }
+    println!("[SIM STEP 1] PASS: Relay stayed OFF in daylight.");
+
+    // Step 2: P3 Dark + PIR Motion -> Duration Auto-OFF
+    println!("[SIM STEP 2] P3 Dark + PIR Motion -> Duration Auto-OFF: lux=30, pir=true");
+    {
+        let mut state = DEVICE_STATE.lock().await;
+        state.current_lux = 30;
+        state.simulated_pir = true;
+    }
+    Timer::after(Duration::from_secs(1)).await;
+    {
+        let mut state = DEVICE_STATE.lock().await;
+        assert!(
+            state.lamp_is_on && state.lamp_on_source == LampOnSource::SensorP3,
+            "[SIM STEP 2] FAIL: P3 did not turn relay ON in dark with PIR motion"
+        );
+        state.simulated_pir = false;
+    }
+    println!("[SIM STEP 2] Relay ON (SensorP3); PIR cleared, waiting 5s for duration=4s auto-OFF...");
+    Timer::after(Duration::from_secs(5)).await;
+    {
+        let state = DEVICE_STATE.lock().await;
+        assert!(
+            !state.lamp_is_on && state.lamp_on_source == LampOnSource::None,
+            "[SIM STEP 2] FAIL: P3 did not turn relay OFF after duration elapsed"
+        );
+    }
+    println!("[SIM STEP 2] PASS: P3 turned relay OFF automatically after duration.");
+
+    // Step 3: P2 Manual Lamp ON Overrides Daylight & Duration
+    println!("[SIM STEP 3] P2 Manual Lamp ON Overrides Daylight & Duration: lux=300, remote_lamp_on=true");
+    {
+        let mut state = DEVICE_STATE.lock().await;
+        state.current_lux = 300;
+        state.simulated_pir = false;
+        state.remote_lamp_on = true;
+    }
+    Timer::after(Duration::from_secs(5)).await;
+    {
+        let state = DEVICE_STATE.lock().await;
+        assert!(
+            state.lamp_is_on && state.lamp_on_source == LampOnSource::ManualP2,
+            "[SIM STEP 3] FAIL: P2 manual ON did not override daylight/duration"
+        );
+    }
+    println!("[SIM STEP 3] PASS: Relay stayed ON for 5s (> duration=4s) in daylight via P2.");
+
+    // Step 4: P2 Manual Lamp OFF
+    println!("[SIM STEP 4] P2 Manual Lamp OFF: remote_lamp_on=false");
+    {
+        let mut state = DEVICE_STATE.lock().await;
+        state.remote_lamp_on = false;
+    }
+    Timer::after(Duration::from_secs(1)).await;
+    {
+        let state = DEVICE_STATE.lock().await;
+        assert!(
+            !state.lamp_is_on && state.lamp_on_source == LampOnSource::None,
+            "[SIM STEP 4] FAIL: P2 manual OFF did not turn relay OFF immediately"
+        );
+    }
+    println!("[SIM STEP 4] PASS: Relay turned OFF immediately via P2.");
+
+    // Step 5: P2 Manual Lamp ON -> P1 SAFETY_OFF_SEC Forced Shutoff
+    println!("[SIM STEP 5] P2 Manual Lamp ON -> P1 SAFETY_OFF_SEC (6s) Forced Shutoff");
+    {
+        let mut state = DEVICE_STATE.lock().await;
+        state.remote_lamp_on = true;
+    }
+    Timer::after(Duration::from_secs(7)).await;
+    {
+        let state = DEVICE_STATE.lock().await;
+        assert!(
+            !state.lamp_is_on
+                && !state.remote_lamp_on
+                && state.lamp_on_source == LampOnSource::None,
+            "[SIM STEP 5] FAIL: P1 SAFETY_OFF_SEC did not force relay OFF and reset remote_lamp_on"
+        );
+    }
+    println!("[SIM STEP 5] PASS: P1 forced relay OFF and reset remote_lamp_on=false.");
+
+    // Step 6: P3 Sensor Recovery After P1 Safety Off
+    println!("[SIM STEP 6] P3 Sensor Recovery After P1 Safety Off: lux=25, pir=true");
+    {
+        let mut state = DEVICE_STATE.lock().await;
+        state.current_lux = 25;
+        state.simulated_pir = true;
+    }
+    Timer::after(Duration::from_secs(1)).await;
+    {
+        let mut state = DEVICE_STATE.lock().await;
+        assert!(
+            state.lamp_is_on && state.lamp_on_source == LampOnSource::SensorP3,
+            "[SIM STEP 6] FAIL: P3 did not recover after P1 safety off"
+        );
+        state.simulated_pir = false;
+    }
+    Timer::after(Duration::from_secs(5)).await;
+    {
+        let state = DEVICE_STATE.lock().await;
+        assert!(
+            !state.lamp_is_on && state.lamp_on_source == LampOnSource::None,
+            "[SIM STEP 6] FAIL: P3 did not turn OFF after duration in recovery step"
+        );
+    }
+    println!("[SIM STEP 6] PASS: P3 sensor automation recovered and turned OFF after duration.");
+    println!("[SIMULATION COMPLETE] All P1/P2/P3 switching scenarios verified!");
+
+    loop {
+        Timer::after(Duration::from_secs(3600)).await;
     }
 }
 
@@ -922,7 +1136,7 @@ fn set_relay_output(
     state: &mut DeviceState,
     on: bool,
 ) {
-    state.relay_on = on;
+    state.lamp_is_on = on;
     if !SIMULATE_HARDWARE && let Some((_, relay)) = pir_relay_opt.as_mut() {
         if on {
             relay.set_high();
@@ -932,7 +1146,7 @@ fn set_relay_output(
     }
 }
 
-/// Non-blocking 100 ms state machine controlling the relay from PIR, lux, and PWA state.
+/// Non-blocking 100 ms offline-resilient state machine enforcing P1/P2/P3 relay priorities.
 #[embassy_executor::task]
 async fn relay_state_machine_task(
     mut pir_relay_opt: Option<(Input<'static>, Output<'static>)>,
@@ -946,87 +1160,117 @@ async fn relay_state_machine_task(
         let now = Instant::now();
         let mut state = DEVICE_STATE.lock().await;
 
-        let (pir_active, relay_is_on) = if SIMULATE_HARDWARE {
-            (state.simulated_pir, state.relay_on)
+        let pir_active = if SIMULATE_HARDWARE {
+            state.simulated_pir
         } else {
-            let (pir, relay) = pir_relay_opt
+            let (pir, _) = pir_relay_opt
                 .as_ref()
                 .expect("PIR and Relay GPIOs must be initialized when SIMULATE_HARDWARE is false");
-            (pir.is_high(), relay.is_set_high())
+            pir.is_high()
         };
 
         tick_count = tick_count.wrapping_add(1);
         if SIMULATE_HARDWARE && tick_count.is_multiple_of(20) {
-            let on_elapsed = state
-                .lamp_turned_on_ts
-                .map_or(0, |ts| ts.elapsed().as_secs());
+            let p2_elapsed = state
+                .p2_turned_on_at
+                .map_or(0, |ts| now.duration_since(ts).as_secs());
             let idle_elapsed = state
                 .last_movement_ts
-                .map_or(0, |ts| ts.elapsed().as_secs());
+                .map_or(0, |ts| now.duration_since(ts).as_secs());
             println!(
-                "SIMULATOR: status | lux={} | pir={} | relay={} | pwa={} | on_elapsed={}s | idle_elapsed={}s",
+                "STATUS: cfg={} | lux={} | pir={} | lamp={} | src={:?} | p2={} | p2_elapsed={}s | idle_elapsed={}s",
+                state.is_configured(),
                 state.current_lux,
                 pir_active,
-                relay_is_on,
-                state.pwa_lamp_on,
-                on_elapsed,
+                state.lamp_is_on,
+                state.lamp_on_source,
+                state.remote_lamp_on,
+                p2_elapsed,
                 idle_elapsed
             );
         }
 
-        // [P1: Safety Override]
-        if relay_is_on
-            && state.pwa_lamp_on
-            && let Some(turned_on_ts) = state.lamp_turned_on_ts
-            && turned_on_ts.elapsed().as_secs() > SAFETY_OFF_SEC
+        // Gate check: do not run P1/P2/P3 automation while any core parameter is 0.
+        if !state.is_configured() {
+            if state.lamp_is_on {
+                set_relay_output(&mut pir_relay_opt, &mut state, false);
+            }
+            state.lamp_on_source = LampOnSource::None;
+            state.p2_turned_on_at = None;
+            state.last_movement_ts = None;
+            prev_pir_active = pir_active;
+            continue;
+        }
+
+        // [P1: Safety Timeout] ONLY applies when the lamp is ON due to P2 (remote_lamp_on == true).
+        if state.remote_lamp_on
+            && state.lamp_on_source == LampOnSource::ManualP2
+            && let Some(p2_ts) = state.p2_turned_on_at
+            && now.duration_since(p2_ts) >= Duration::from_secs(state.safety_off_sec)
         {
             set_relay_output(&mut pir_relay_opt, &mut state, false);
-            state.pwa_lamp_on = false;
-            state.lamp_turned_on_ts = None;
+            state.remote_lamp_on = false;
+            state.p2_turned_on_at = None;
+            state.lamp_on_source = LampOnSource::None;
+            state.last_movement_ts = None;
             println!(
-                "SIMULATOR: Safety timeout ({}s) reached -> Relay OFF",
-                SAFETY_OFF_SEC
+                "[P1 SAFETY OFF] Manual lamp ON exceeded SAFETY_OFF_SEC ({}s) -> Forced OFF",
+                state.safety_off_sec
             );
             prev_pir_active = pir_active;
             continue;
         }
 
-        // [P2: PWA Override]
-        if state.pwa_lamp_on {
-            if !relay_is_on {
+        // [P2: PWA / Captive Portal Manual Switch]
+        if state.remote_lamp_on {
+            if !state.lamp_is_on || state.lamp_on_source != LampOnSource::ManualP2 {
                 set_relay_output(&mut pir_relay_opt, &mut state, true);
-                state.lamp_turned_on_ts = Some(now);
-                println!("SIMULATOR: PWA override active -> Relay ON");
+                state.lamp_on_source = LampOnSource::ManualP2;
+                state.p2_turned_on_at = Some(now);
+                println!("[P2 MANUAL ON] Lamp turned ON via PWA/Portal switch");
             }
+            prev_pir_active = pir_active;
+            continue;
+        } else if state.lamp_on_source == LampOnSource::ManualP2 {
+            set_relay_output(&mut pir_relay_opt, &mut state, false);
+            state.p2_turned_on_at = None;
+            state.lamp_on_source = LampOnSource::None;
+            state.last_movement_ts = None;
+            println!("[P2 MANUAL OFF] Lamp turned OFF via PWA/Portal switch");
             prev_pir_active = pir_active;
             continue;
         }
 
-        // [P3: Auto Mode]
-        if !relay_is_on {
-            if pir_active && state.current_lux < LUX_THRESHOLD {
-                set_relay_output(&mut pir_relay_opt, &mut state, true);
+        // [P3: PIR + BH1750 Lux Automation] (only evaluated when remote_lamp_on == false)
+        if pir_active {
+            if !state.lamp_is_on {
+                if state.current_lux < state.threshold {
+                    set_relay_output(&mut pir_relay_opt, &mut state, true);
+                    state.lamp_on_source = LampOnSource::SensorP3;
+                    state.last_movement_ts = Some(now);
+                    println!(
+                        "[P3 SENSOR ON] PIR active & lux ({}) < threshold ({}) -> Lamp ON",
+                        state.current_lux, state.threshold
+                    );
+                }
+            } else if state.lamp_on_source == LampOnSource::SensorP3 {
                 state.last_movement_ts = Some(now);
-                state.lamp_turned_on_ts = Some(now);
-                println!(
-                    "SIMULATOR: PIR active & Lux ({}) < threshold ({}) -> Relay ON",
-                    state.current_lux, LUX_THRESHOLD
-                );
+                if SIMULATE_HARDWARE && !prev_pir_active {
+                    println!("[P3 MOTION] PIR active while Lamp ON -> duration timer refreshed");
+                }
             }
-        } else if pir_active {
-            state.last_movement_ts = Some(now);
-            if SIMULATE_HARDWARE && !prev_pir_active {
-                println!("SIMULATOR: PIR active while Relay ON -> movement timer reset");
-            }
-        } else if state
-            .last_movement_ts
-            .is_none_or(|ts| ts.elapsed().as_secs() > PIR_DURATION_SEC)
+        } else if state.lamp_is_on
+            && state.lamp_on_source == LampOnSource::SensorP3
+            && state
+                .last_movement_ts
+                .is_none_or(|ts| now.duration_since(ts) >= Duration::from_secs(state.duration))
         {
             set_relay_output(&mut pir_relay_opt, &mut state, false);
-            state.lamp_turned_on_ts = None;
+            state.last_movement_ts = None;
+            state.lamp_on_source = LampOnSource::None;
             println!(
-                "SIMULATOR: PIR timeout ({}s) reached -> Relay OFF",
-                PIR_DURATION_SEC
+                "[P3 DURATION OFF] No PIR motion for {}s -> Lamp OFF",
+                state.duration
             );
         }
 
@@ -1234,7 +1478,7 @@ async fn run_captive_portal(
     let ap_cfg = AccessPointConfig::default()
         .with_ssid(device_name.try_into().expect("valid AP SSID"))
         .with_authentication(AuthenticationMethodConfig::Wpa2Personal(
-            AP_PASSWORD.try_into().expect("valid AP password"),
+            FACTORY_PASSKEY.try_into().expect("valid AP password"),
         ));
     controller
         .set_config(&Config::AccessPoint(ap_cfg))
@@ -1251,7 +1495,7 @@ async fn run_captive_portal(
 
     println!(
         "SoftAP '{}' (WPA2 pass: '{}') active at http://{}/",
-        device_name, AP_PASSWORD, AP_IP
+        device_name, FACTORY_PASSKEY, AP_IP
     );
 
     let portal_html = build_portal_html(&scanned_ssids);
