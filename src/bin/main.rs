@@ -8,14 +8,10 @@ extern crate alloc;
 mod secrets;
 
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
-use core::{
-    cell::RefCell,
-    fmt::Write as _,
-    sync::atomic::{AtomicU8, Ordering},
-};
+use core::{cell::RefCell, fmt::Write as _};
 use critical_section::Mutex;
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either4, select4};
+use embassy_futures::select::{Either, Either4, select, select4};
 use embassy_net::{
     DhcpConfig, IpAddress, IpEndpoint, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources,
     StaticConfigV4,
@@ -39,8 +35,8 @@ use esp_bootloader_esp_idf::partitions::{
 };
 use esp_hal::{
     Async,
-    gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
-    i2c::master::{Config as I2cConfig, I2c},
+    gpio::{Input, Output},
+    i2c::master::I2c,
     peripherals::{GPIO48, RMT},
     rmt::Rmt,
     rng::Rng,
@@ -59,61 +55,55 @@ use reqwless::{
     headers::ContentType,
     request::{Method, RequestBuilder as _},
 };
+use serde::{Deserialize, Serialize};
 use smart_leds::{RGB8, SmartLedsWrite, brightness};
 use static_cell::StaticCell;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
 const NVS_FALLBACK_OFFSET: u32 = 0x9000;
-const CRED_MAGIC: [u8; 4] = *b"SLWC";
-const CRED_VERSION: u8 = 1;
-const CRED_RECORD_LEN: usize = 108;
+const NVS_MAGIC: [u8; 4] = *b"SLN2";
+const NVS_VERSION: u8 = 2;
+const NVS_RECORD_LEN: usize = 128;
 
 const FACTORY_PASSKEY: &str = "K7M9P2X4R8";
 const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
-const AP_BOOT_WINDOW_SECS: u64 = 60;
+const AP_BOOT_WINDOW_SECS: u64 = 300;
 const PAIRING_WINDOW_SECS: u64 = 300;
 const PAIRING_RETRY_INTERVAL_SECS: u64 = 10;
-const MAX_POST_BODY_BYTES: usize = 256;
+const MAX_POST_BODY_BYTES: usize = 512;
 const KEEPALIVE_INTERVAL_SECS: u64 = 15;
 const CLOUD_FUNC_URL: &str = "https://verifypairing-lfmgd4eena-uc.a.run.app";
 const ESP_AUTH_TOKEN: &str = "ESP32_SECRET_TOKEN_998877";
 
-#[derive(Copy, Clone, Eq, PartialEq)]
-#[repr(u8)]
-enum LedState {
-    ApMode = 0,
-    Connecting = 1,
-    Connected = 2,
-    Error = 3,
-    Off = 4,
-}
-
-impl LedState {
-    fn from_u8(v: u8) -> Self {
-        match v {
-            0 => Self::ApMode,
-            1 => Self::Connecting,
-            2 => Self::Connected,
-            3 => Self::Error,
-            _ => Self::Off,
-        }
-    }
-}
-
-static LED_STATE: AtomicU8 = AtomicU8::new(LedState::ApMode as u8);
-
-fn set_led_state(state: LedState) {
-    LED_STATE.store(state as u8, Ordering::Relaxed);
-}
-
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct WifiCredentials {
     ssid: String,
     password: String,
 }
 
-/// Background task driving the onboard WS2812 status LED based on `LED_STATE`.
+#[derive(Copy, Clone, Eq, PartialEq, Default)]
+struct DeviceConfig {
+    threshold: u16,
+    duration: u64,
+    sensitivity: u8,
+    delay: u16,
+}
+
+impl DeviceConfig {
+    fn is_configured(&self) -> bool {
+        self.threshold != 0 && self.duration != 0 && self.sensitivity != 0 && self.delay != 0
+    }
+}
+
+#[derive(Clone, Default)]
+struct NvsData {
+    config: DeviceConfig,
+    wifi: Option<WifiCredentials>,
+}
+
+/// Background task driving the onboard WS2812 RGB LED exclusively to mirror `lamp_is_on`:
+/// solid white (`255, 255, 255`) when ON and off (`0, 0, 0`) when OFF.
 #[embassy_executor::task]
 async fn led_task(rmt_periph: RMT<'static>, pin: GPIO48<'static>) -> ! {
     let rmt_freq = Rate::from_mhz(80);
@@ -126,82 +116,26 @@ async fn led_task(rmt_periph: RMT<'static>, pin: GPIO48<'static>) -> ! {
     )
     .expect("WS2812 init failed");
 
-    let mut blink_on = false;
+    let mut last_lamp_on: Option<bool> = None;
 
     loop {
-        let state = LedState::from_u8(LED_STATE.load(Ordering::Relaxed));
-
-        match state {
-            LedState::ApMode => {
-                blink_on = !blink_on;
-                let color = if blink_on {
-                    RGB8::new(0, 0, 255)
-                } else {
-                    RGB8::new(0, 0, 0)
-                };
-                let _ = led.write(brightness(core::iter::once(color), 30));
-                Timer::after(Duration::from_millis(300)).await;
-            }
-            LedState::Connecting => {
-                blink_on = !blink_on;
-                let color = if blink_on {
-                    RGB8::new(255, 180, 0)
-                } else {
-                    RGB8::new(0, 0, 0)
-                };
-                let _ = led.write(brightness(core::iter::once(color), 30));
-                Timer::after(Duration::from_millis(200)).await;
-            }
-            LedState::Connected => {
-                if SIMULATE_HARDWARE {
-                    let mut last_relay_on: Option<bool> = None;
-                    while LED_STATE.load(Ordering::Relaxed) == LedState::Connected as u8 {
-                        let relay_on = {
-                            let state = DEVICE_STATE.lock().await;
-                            state.lamp_is_on
-                        };
-                        if last_relay_on != Some(relay_on) {
-                            let color = if relay_on {
-                                RGB8::new(50, 50, 50)
-                            } else {
-                                RGB8::new(0, 0, 0)
-                            };
-                            let _ = led.write(core::iter::once(color));
-                            last_relay_on = Some(relay_on);
-                        }
-                        Timer::after(Duration::from_millis(100)).await;
-                    }
-                } else {
-                    let _ = led.write(brightness(core::iter::once(RGB8::new(255, 0, 0)), 30));
-                    Timer::after(Duration::from_millis(500)).await;
-                    let _ = led.write(brightness(core::iter::once(RGB8::new(0, 0, 0)), 0));
-                    for _ in 0..120 {
-                        if LED_STATE.load(Ordering::Relaxed) != LedState::Connected as u8 {
-                            break;
-                        }
-                        Timer::after(Duration::from_millis(250)).await;
-                    }
-                }
-            }
-            LedState::Error => {
-                blink_on = !blink_on;
-                let color = if blink_on {
-                    RGB8::new(255, 0, 0)
-                } else {
-                    RGB8::new(0, 0, 0)
-                };
-                let _ = led.write(brightness(core::iter::once(color), 30));
-                Timer::after(Duration::from_millis(250)).await;
-            }
-            LedState::Off => {
+        let lamp_on = {
+            let state = DEVICE_STATE.lock().await;
+            state.lamp_is_on
+        };
+        if last_lamp_on != Some(lamp_on) {
+            if lamp_on {
+                let _ = led.write(brightness(core::iter::once(RGB8::new(255, 255, 255)), 96));
+            } else {
                 let _ = led.write(brightness(core::iter::once(RGB8::new(0, 0, 0)), 0));
-                Timer::after(Duration::from_millis(100)).await;
             }
+            last_lamp_on = Some(lamp_on);
         }
+        Timer::after(Duration::from_millis(50)).await;
     }
 }
 
-/// Computes a 32-bit FNV-1a checksum for credential integrity verification.
+/// Computes a 32-bit FNV-1a checksum for NVS integrity verification.
 fn fnv1a_32(data: &[u8]) -> u32 {
     let mut hash: u32 = 0x811c_9dc5;
     for &b in data {
@@ -222,56 +156,82 @@ fn nvs_partition_offset(flash: &mut FlashStorage<'_>) -> u32 {
     NVS_FALLBACK_OFFSET
 }
 
-/// Reads and validates saved Wi-Fi credentials from flash.
-fn load_credentials(flash: &mut FlashStorage<'_>) -> Option<WifiCredentials> {
+/// Reads and validates the 4 core config parameters and single Wi-Fi credential slot from NVS.
+fn load_nvs_data(flash: &mut FlashStorage<'_>) -> NvsData {
     let offset = nvs_partition_offset(flash);
-    let mut buf = [0u8; CRED_RECORD_LEN];
+    let mut buf = [0u8; NVS_RECORD_LEN];
     if flash.read(offset, &mut buf).is_err() {
-        return None;
+        return NvsData::default();
     }
 
-    if buf[0..4] != CRED_MAGIC || buf[4] != CRED_VERSION {
-        return None;
+    if buf[0..4] != NVS_MAGIC || buf[4] != NVS_VERSION {
+        return NvsData::default();
     }
 
-    let ssid_len = buf[5] as usize;
-    let pass_len = buf[6] as usize;
-    if ssid_len == 0 || ssid_len > 32 || pass_len > 64 {
-        return None;
+    let expected_crc = u32::from_le_bytes([buf[124], buf[125], buf[126], buf[127]]);
+    if fnv1a_32(&buf[0..124]) != expected_crc {
+        return NvsData::default();
     }
 
-    let expected_crc = u32::from_le_bytes([buf[104], buf[105], buf[106], buf[107]]);
-    if fnv1a_32(&buf[0..104]) != expected_crc {
-        return None;
-    }
+    let config = DeviceConfig {
+        threshold: u16::from_le_bytes([buf[8], buf[9]]),
+        duration: u64::from_le_bytes([
+            buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
+        ]),
+        sensitivity: buf[18],
+        delay: u16::from_le_bytes([buf[19], buf[20]]),
+    };
 
-    let ssid = core::str::from_utf8(&buf[8..8 + ssid_len]).ok()?;
-    let password = core::str::from_utf8(&buf[40..40 + pass_len]).ok()?;
+    let has_wifi = buf[5] == 1;
+    let wifi = if has_wifi {
+        let ssid_len = buf[6] as usize;
+        let pass_len = buf[7] as usize;
+        if ssid_len == 0 || ssid_len > 32 || pass_len > 64 {
+            None
+        } else if let (Ok(ssid), Ok(password)) = (
+            core::str::from_utf8(&buf[28..28 + ssid_len]),
+            core::str::from_utf8(&buf[60..60 + pass_len]),
+        ) {
+            Some(WifiCredentials {
+                ssid: String::from(ssid),
+                password: String::from(password),
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
-    Some(WifiCredentials {
-        ssid: String::from(ssid),
-        password: String::from(password),
-    })
+    NvsData { config, wifi }
 }
 
-/// Serializes and writes Wi-Fi credentials with a checksum to the NVS flash region.
-fn save_credentials(flash: &mut FlashStorage<'_>, creds: &WifiCredentials) -> Result<(), ()> {
-    let ssid_bytes = creds.ssid.as_bytes();
-    let pass_bytes = creds.password.as_bytes();
-    if ssid_bytes.is_empty() || ssid_bytes.len() > 32 || pass_bytes.len() > 64 {
-        return Err(());
+/// Serializes and writes the 4 core config parameters and single Wi-Fi credential slot to NVS.
+fn save_nvs_data(flash: &mut FlashStorage<'_>, data: &NvsData) -> Result<(), ()> {
+    let mut buf = [0u8; NVS_RECORD_LEN];
+    buf[0..4].copy_from_slice(&NVS_MAGIC);
+    buf[4] = NVS_VERSION;
+
+    buf[8..10].copy_from_slice(&data.config.threshold.to_le_bytes());
+    buf[10..18].copy_from_slice(&data.config.duration.to_le_bytes());
+    buf[18] = data.config.sensitivity;
+    buf[19..21].copy_from_slice(&data.config.delay.to_le_bytes());
+
+    if let Some(creds) = &data.wifi {
+        let ssid_bytes = creds.ssid.as_bytes();
+        let pass_bytes = creds.password.as_bytes();
+        if ssid_bytes.is_empty() || ssid_bytes.len() > 32 || pass_bytes.len() > 64 {
+            return Err(());
+        }
+        buf[5] = 1;
+        buf[6] = ssid_bytes.len() as u8;
+        buf[7] = pass_bytes.len() as u8;
+        buf[28..28 + ssid_bytes.len()].copy_from_slice(ssid_bytes);
+        buf[60..60 + pass_bytes.len()].copy_from_slice(pass_bytes);
     }
 
-    let mut buf = [0u8; CRED_RECORD_LEN];
-    buf[0..4].copy_from_slice(&CRED_MAGIC);
-    buf[4] = CRED_VERSION;
-    buf[5] = ssid_bytes.len() as u8;
-    buf[6] = pass_bytes.len() as u8;
-    buf[8..8 + ssid_bytes.len()].copy_from_slice(ssid_bytes);
-    buf[40..40 + pass_bytes.len()].copy_from_slice(pass_bytes);
-
-    let crc = fnv1a_32(&buf[0..104]);
-    buf[104..108].copy_from_slice(&crc.to_le_bytes());
+    let crc = fnv1a_32(&buf[0..124]);
+    buf[124..128].copy_from_slice(&crc.to_le_bytes());
 
     let offset = nvs_partition_offset(flash);
     flash.write(offset, &buf).map_err(|_| ())
@@ -453,33 +413,127 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// Extracts `ssid` and `password` from a URL-encoded form body.
-fn parse_credentials_form(body: &str) -> Option<WifiCredentials> {
-    let mut ssid = None;
-    let mut manual_ssid = None;
-    let mut password = String::new();
+#[derive(Deserialize)]
+struct WifiSubmitPayload {
+    ssid: String,
+    pass: String,
+}
 
-    for pair in body.split('&') {
+#[derive(Deserialize)]
+struct ConfigSubmitPayload {
+    threshold: u16,
+    duration: u64,
+    sensitivity: u8,
+    delay: u16,
+}
+
+#[derive(Serialize)]
+struct PortalStatusJson<'a> {
+    device_name: &'a str,
+    limitless: bool,
+    remaining_secs: Option<u64>,
+    has_saved_wifi: bool,
+    saved_ssid: &'a str,
+    last_wifi_error: bool,
+    configured: bool,
+    lamp_is_on: bool,
+    remote_lamp_on: bool,
+    threshold: u16,
+    duration: u64,
+    sensitivity: u8,
+    delay: u16,
+}
+
+enum PortalOutcome {
+    ConnectWifi(WifiCredentials),
+    TimeoutExpired,
+}
+
+/// Parses Wi-Fi submission from JSON (`{"ssid":...,"pass":...}`) or URL-encoded form body.
+/// Only accepts non-empty SSID (dropdown selection) and non-empty password.
+fn parse_wifi_submit(body: &str) -> Option<WifiCredentials> {
+    let trimmed = body.trim();
+    if trimmed.starts_with('{') {
+        let parsed: WifiSubmitPayload = serde_json::from_str(trimmed).ok()?;
+        if parsed.ssid.is_empty()
+            || parsed.ssid.len() > 32
+            || parsed.pass.is_empty()
+            || parsed.pass.len() > 64
+        {
+            return None;
+        }
+        return Some(WifiCredentials {
+            ssid: parsed.ssid,
+            password: parsed.pass,
+        });
+    }
+
+    let mut ssid = None;
+    let mut password = None;
+    for pair in trimmed.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             let val = url_decode(v);
             match k {
                 "ssid" if !val.is_empty() => ssid = Some(val),
-                "manual_ssid" if !val.is_empty() => manual_ssid = Some(val),
-                "password" => password = val,
+                "pass" | "password" if !val.is_empty() => password = Some(val),
                 _ => {}
             }
         }
     }
 
-    let final_ssid = manual_ssid.or(ssid)?;
-    if final_ssid.is_empty() || final_ssid.len() > 32 || password.len() > 64 {
+    let final_ssid = ssid?;
+    let final_pass = password?;
+    if final_ssid.len() > 32 || final_pass.len() > 64 {
         return None;
     }
 
     Some(WifiCredentials {
         ssid: final_ssid,
-        password,
+        password: final_pass,
     })
+}
+
+/// Parses the 4 configuration parameters from JSON or URL-encoded form body and ensures all are non-zero.
+fn parse_config_submit(body: &str) -> Option<DeviceConfig> {
+    let trimmed = body.trim();
+    let cfg = if trimmed.starts_with('{') {
+        let parsed: ConfigSubmitPayload = serde_json::from_str(trimmed).ok()?;
+        DeviceConfig {
+            threshold: parsed.threshold,
+            duration: parsed.duration,
+            sensitivity: parsed.sensitivity,
+            delay: parsed.delay,
+        }
+    } else {
+        let mut threshold = None;
+        let mut duration = None;
+        let mut sensitivity = None;
+        let mut delay = None;
+        for pair in trimmed.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                let val = url_decode(v);
+                match k {
+                    "threshold" => threshold = val.trim().parse::<u16>().ok(),
+                    "duration" => duration = val.trim().parse::<u64>().ok(),
+                    "sensitivity" => sensitivity = val.trim().parse::<u8>().ok(),
+                    "delay" => delay = val.trim().parse::<u16>().ok(),
+                    _ => {}
+                }
+            }
+        }
+        DeviceConfig {
+            threshold: threshold?,
+            duration: duration?,
+            sensitivity: sensitivity?,
+            delay: delay?,
+        }
+    };
+
+    if cfg.is_configured() {
+        Some(cfg)
+    } else {
+        None
+    }
 }
 
 /// Escapes HTML special characters to prevent XSS in generated portal pages.
@@ -498,42 +552,300 @@ fn html_escape(input: &str) -> String {
     escaped
 }
 
-/// Builds the captive portal HTML page with scanned SSIDs and manual entry fallback.
-fn build_portal_html(ssids: &[String]) -> String {
-    let mut html = String::from(
-        "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>\
-         <title>SmartLight Wi-Fi Setup</title><style>\
-         body{font-family:sans-serif;max-width:420px;margin:2rem auto;padding:0 1rem;background:#111;color:#eee}\
-         input,select,button{width:100%;padding:.6rem;margin:.4rem 0 1rem;box-sizing:border-box;border-radius:6px;border:1px solid #444;background:#222;color:#fff}\
-         button{background:#2563eb;border:none;font-weight:bold;cursor:pointer}\
-         </style></head><body><h2>SmartLight Wi-Fi Setup</h2><form method='POST' action='/save'>",
+/// Builds the responsive two-view Hungarian Captive Portal HTML/CSS/JS page.
+fn build_portal_html(
+    device_name: &str,
+    ssids: &[String],
+    initial_view: &str,
+    remaining_secs: Option<u64>,
+    last_wifi_error: bool,
+    cfg: DeviceConfig,
+    lamp_is_on: bool,
+    saved_ssid: Option<&str>,
+) -> String {
+    let safe_dev = html_escape(device_name);
+    let mut html = String::with_capacity(8192);
+    let _ = write!(
+        html,
+        "<!DOCTYPE html><html lang='hu'><head><meta charset='utf-8'>\
+         <meta name='viewport' content='width=device-width,initial-scale=1'>\
+         <title>{dev} – Captive Portal</title><style>\
+         *{{box-sizing:border-box}}\
+         body{{font-family:system-ui,-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:1rem;background:#0f172a;color:#f1f5f9;line-height:1.45}}\
+         .card{{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:1rem;margin-bottom:1rem}}\
+         .warn{{background:#78350f;border:1px solid #f59e0b;color:#fef3c7;border-radius:8px;padding:.85rem;margin-bottom:1rem;font-size:.92rem;font-weight:600}}\
+         .err{{background:#7f1d1d;border:1px solid #ef4444;color:#fee2e2;border-radius:8px;padding:.85rem;margin-bottom:1rem;font-size:.9rem}}\
+         .ok{{background:#14532d;border:1px solid #22c55e;color:#dcfce7;border-radius:8px;padding:.75rem;margin-bottom:1rem;font-size:.9rem;display:none}}\
+         .timer{{background:#0b1220;border:1px solid #38bdf8;color:#bae6fd;border-radius:8px;padding:.75rem;text-align:center;font-weight:700;margin-bottom:1rem}}\
+         h1{{font-size:1.25rem;margin:0 0 .25rem}}\
+         h2{{font-size:1.05rem;margin:0 0 .75rem;color:#93c5fd}}\
+         p,li{{font-size:.9rem;color:#cbd5e1}}\
+         ol{{padding-left:1.25rem;margin:.5rem 0}}\
+         label{{display:block;font-size:.88rem;color:#cbd5e1;margin-top:.65rem;font-weight:600}}\
+         input,select,button{{width:100%;padding:.68rem;margin:.35rem 0 .6rem;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#f8fafc;font-size:.95rem}}\
+         button{{background:#2563eb;border:none;font-weight:700;cursor:pointer}}\
+         button:disabled{{background:#475569;color:#94a3b8;cursor:not-allowed}}\
+         .btn-sec{{background:#334155}}\
+         .btn-warn{{background:#b45309}}\
+         .btn-danger{{background:#b91c1c}}\
+         .btn-lamp-on{{background:#16a34a}}\
+         .btn-lamp-off{{background:#475569}}\
+         .row{{display:flex;gap:.5rem}}\
+         .hidden{{display:none}}\
+         .status-pill{{padding:.6rem;border-radius:8px;text-align:center;font-weight:700;margin-bottom:.75rem;background:#0f172a;border:1px solid #475569}}\
+         </style></head><body>\
+         <div class='warn'>FIGYELEM: A vezérlési paraméterek (Config) beállítására és a helyi kézi kapcsolásra kizárólag a Wi-Fi hálózatra történő csatlakozás ELŐTT (AP módban) van lehetőség!</div>",
+        dev = safe_dev
     );
 
-    if !ssids.is_empty() {
-        html.push_str("<label>Available Networks</label><select name='ssid'><option value=''>-- Select network --</option>");
-        for s in ssids {
-            let safe_ssid = html_escape(s);
-            let _ = write!(html, "<option value='{0}'>{0}</option>", safe_ssid);
+    if last_wifi_error {
+        html.push_str(
+            "<div id='wifi-error-banner' class='err'><strong>Sikertelen Wi-Fi csatlakozás!</strong> A megadott hálózathoz nem sikerült csatlakozni (hibás jelszó vagy nem elérhető hálózat). A korábbi NVS adatok változatlanok maradtak, az AP időkorlát nélkül fut.</div>",
+        );
+    } else {
+        html.push_str("<div id='wifi-error-banner' class='err hidden'></div>");
+    }
+    html.push_str("<div id='msg-banner' class='ok'></div>");
+
+    // View 1: Main View (Wi-Fi Provisioning, Onboarding & System Actions)
+    let view1_cls = if initial_view == "config" { "hidden" } else { "" };
+    let view2_cls = if initial_view == "config" { "" } else { "hidden" };
+
+    let _ = write!(
+        html,
+        "<div id='view-main' class='{v1}'>\
+         <div class='card'><h1>{dev}</h1><p>Helyi AP felület és Wi-Fi beállítás</p>",
+        v1 = view1_cls,
+        dev = safe_dev
+    );
+
+    match remaining_secs {
+        Some(secs) => {
+            let mm = secs / 60;
+            let ss = secs % 60;
+            let _ = write!(
+                html,
+                "<div id='countdown-box' class='timer'>Hátralévő idő a Wi-Fi csatlakozásig: {:02}:{:02}</div>",
+                mm, ss
+            );
         }
-        html.push_str("</select>");
+        None => {
+            html.push_str(
+                "<div id='countdown-box' class='timer'>Időkorlát nélküli helyi AP üzemmód</div>",
+            );
+        }
+    }
+
+    if let Some(s) = saved_ssid {
+        let _ = write!(
+            html,
+            "<p id='saved-wifi-info'>Mentett Wi-Fi hálózat: <strong>{}</strong></p>",
+            html_escape(s)
+        );
+    } else {
+        html.push_str("<p id='saved-wifi-info'>Nincs mentett Wi-Fi hálózat az NVS memóriában.</p>");
     }
 
     html.push_str(
-        "<label>Or Enter SSID Manually</label><input type='text' name='manual_ssid' maxlength='32' placeholder='Wi-Fi SSID'>\
-         <label>Password</label><input type='password' name='password' maxlength='64' placeholder='Leave blank if open'>\
-         <button type='submit'>Save & Connect</button></form></body></html>",
+        "<button type='button' class='btn-sec' onclick=\"showView('config')\">⚙️ Konfiguráció és Kézi Kapcsolás (Config)</button></div>\
+         <div class='card'><h2>Beüzemelési és Párosítási Útmutató</h2><ol>\
+         <li><strong>Konfigurálás (opcionális):</strong> A fenti <em>Config</em> gombbal állítsd be a 4 szenzor/időzítő paramétert és tesztelheted a lámpa kézi kapcsolását.</li>\
+         <li><strong>Wi-Fi csatlakozás:</strong> Válaszd ki az otthoni Wi-Fi hálózatot a listából, add meg a jelszót, majd nyomd meg a <em>Csatlakozás és Mentés</em> gombot.</li>",
     );
+    let _ = write!(
+        html,
+        "<li><strong>PWA párosítás:</strong> Sikeres Wi-Fi csatlakozás után nyisd meg a SmartLight PWA alkalmazást, és párosítsd az eszközt (<strong>{dev}</strong>) az eszközön található 10 karakteres biztonsági kóddal a 5 perces párosítási ablakon belül.</li></ol></div>",
+        dev = safe_dev
+    );
+
+    html.push_str(
+        "<div class='card'><h2>Wi-Fi Hálózat Beállítása (Verify-Before-Save)</h2>\
+         <form id='wifiForm' onsubmit='submitWifi(event)'>\
+         <label for='ssid'>Elérhető Wi-Fi hálózatok (kizárólag listából)</label>\
+         <select name='ssid' id='ssid' onchange='validateWifiForm()'><option value=''>-- Válassz Wi-Fi hálózatot --</option>",
+    );
+    for s in ssids {
+        let safe_s = html_escape(s);
+        let _ = write!(html, "<option value='{0}'>{0}</option>", safe_s);
+    }
+    html.push_str(
+        "</select>\
+         <button type='button' class='btn-sec' id='scanBtn' onclick='scanWifi()'>🔄 Wi-Fi lista frissítése</button>\
+         <label for='pass'>Wi-Fi Jelszó (csak írásra)</label>\
+         <input type='password' name='pass' id='pass' maxlength='64' autocomplete='new-password' placeholder='Add meg a Wi-Fi jelszót' oninput='validateWifiForm()'>\
+         <button type='submit' id='connectBtn' disabled>Csatlakozás és Mentés</button>\
+         </form></div>\
+         <div class='card'><h2>Rendszerműveletek</h2>\
+         <button type='button' class='btn-warn' onclick='clearWifi()'>🗑️ Mentett Wi-Fi adatok törlése</button>\
+         <button type='button' class='btn-danger' onclick='restartDevice()'>🔄 Eszköz Újraindítása (Restart)</button>\
+         </div></div>",
+    );
+
+    // View 2: Config View (Local Parameters & Lamp Switch)
+    let lamp_text = if lamp_is_on {
+        "Lámpa állapota: BEKAPCSOLVA"
+    } else {
+        "Lámpa állapota: KIKAPCSOLVA"
+    };
+    let lamp_cls = if lamp_is_on {
+        "btn-lamp-on"
+    } else {
+        "btn-lamp-off"
+    };
+    let _ = write!(
+        html,
+        "<div id='view-config' class='{v2}'>\
+         <div class='card'><h2>Helyi Kézi Kapcsolás (P2)</h2>\
+         <div id='lamp-status' class='status-pill'>{ltxt}</div>\
+         <button type='button' id='toggleLampBtn' class='{lcls}' onclick='toggleLamp()'>💡 Lámpa BE / KI kapcsolása</button></div>\
+         <div class='card'><h2>Vezérlési Paraméterek (Config)</h2>\
+         <p>Minden paraméternek 0-tól különbözőnek kell lennie az automatika aktiválásához.</p>\
+         <form id='cfgForm' onsubmit='saveConfig(event)'>\
+         <label for='threshold'>Lux küszöb (threshold)</label>\
+         <input type='number' id='threshold' name='threshold' min='1' max='65535' value='{th}' required>\
+         <label for='duration'>Világítási idő mozgás után – mp (duration)</label>\
+         <input type='number' id='duration' name='duration' min='1' max='86400' value='{du}' required>\
+         <label for='sensitivity'>Érzékenység – 1..255 (sensitivity)</label>\
+         <input type='number' id='sensitivity' name='sensitivity' min='1' max='255' value='{se}' required>\
+         <label for='delay'>Késleltetés (delay)</label>\
+         <input type='number' id='delay' name='delay' min='1' max='65535' value='{de}' required>\
+         <button type='submit'>💾 Konfiguráció Mentése</button>\
+         </form>\
+         <button type='button' class='btn-sec' onclick=\"showView('main')\">⬅️ Vissza a Wi-Fi beállításokhoz</button>\
+         </div></div>",
+        v2 = view2_cls,
+        ltxt = lamp_text,
+        lcls = lamp_cls,
+        th = cfg.threshold,
+        du = cfg.duration,
+        se = cfg.sensitivity,
+        de = cfg.delay,
+    );
+
+    let init_rem_js = match remaining_secs {
+        Some(s) => alloc::format!("{}", s),
+        None => String::from("null"),
+    };
+    let _ = write!(
+        html,
+        "<script>\
+         let remSecs={rem};\
+         function showMsg(txt,isErr){{const m=document.getElementById('msg-banner'),e=document.getElementById('wifi-error-banner');\
+         if(isErr){{e.textContent=txt;e.classList.remove('hidden');m.style.display='none';}}\
+         else{{m.textContent=txt;m.style.display='block';e.classList.add('hidden');}}}}\
+         function showView(v){{document.getElementById('view-main').classList.toggle('hidden',v!=='main');\
+         document.getElementById('view-config').classList.toggle('hidden',v!=='config');}}\
+         function validateWifiForm(){{const s=document.getElementById('ssid').value,p=document.getElementById('pass').value;\
+         document.getElementById('connectBtn').disabled=!(s&&s.length>0&&p.length>0);}}\
+         function renderTimer(){{const b=document.getElementById('countdown-box');\
+         if(remSecs===null){{b.textContent='Időkorlát nélküli helyi AP üzemmód';}}\
+         else{{const m=String(Math.floor(remSecs/60)).padStart(2,'0'),s=String(remSecs%60).padStart(2,'0');\
+         b.textContent='Hátralévő idő a Wi-Fi csatlakozásig: '+m+':'+s;}}}}\
+         setInterval(()=>{{if(remSecs!==null&&remSecs>0){{remSecs--;renderTimer();}}}},1000);\
+         setInterval(async()=>{{try{{const r=await fetch('/status');if(!r.ok)return;const d=await r.json();\
+         remSecs=d.limitless?null:d.remaining_secs;renderTimer();updateLampUi(d.lamp_is_on);}}catch(_){{}}}},5000);\
+         function updateLampUi(on){{const ls=document.getElementById('lamp-status'),btn=document.getElementById('toggleLampBtn');\
+         ls.textContent=on?'Lámpa állapota: BEKAPCSOLVA':'Lámpa állapota: KIKAPCSOLVA';\
+         btn.className=on?'btn-lamp-on':'btn-lamp-off';}}\
+         async function scanWifi(){{const btn=document.getElementById('scanBtn'),sel=document.getElementById('ssid');\
+         btn.disabled=true;btn.textContent='Keresés...';\
+         try{{const r=await fetch('/scan');const arr=await r.json();const cur=sel.value;\
+         sel.innerHTML=\"<option value=''>-- Válassz Wi-Fi hálózatot --</option>\";\
+         arr.forEach(s=>{{const o=document.createElement('option');o.value=s;o.textContent=s;if(s===cur)o.selected=true;sel.appendChild(o);}});\
+         validateWifiForm();showMsg('Wi-Fi lista frissítve ('+arr.length+' hálózat).',false);}}catch(_){{showMsg('Hiba a Wi-Fi keresés során.',true);}}\
+         btn.disabled=false;btn.textContent='🔄 Wi-Fi lista frissítése';}}\
+         async function submitWifi(e){{e.preventDefault();const ssid=document.getElementById('ssid').value,pass=document.getElementById('pass').value;\
+         if(!ssid||!pass)return;document.getElementById('connectBtn').disabled=true;\
+         showMsg('Csatlakozás és ellenőrzés folyamatban ('+ssid+')... Ha sikertelen, az AP újraindul.',false);\
+         try{{await fetch('/connect-wifi',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{ssid,pass}})}});}}catch(_){{}}}}\
+         async function clearWifi(){{if(!confirm('Biztosan törlöd a mentett Wi-Fi adatokat?'))return;\
+         const r=await fetch('/clear-wifi',{{method:'POST'}});if(r.ok){{remSecs=null;renderTimer();\
+         document.getElementById('saved-wifi-info').textContent='Nincs mentett Wi-Fi hálózat az NVS memóriában.';\
+         showMsg('Mentett Wi-Fi adatok törölve. Az eszköz időkorlát nélküli AP módban marad.',false);}}}}\
+         async function restartDevice(){{if(!confirm('Biztosan újraindítod az eszközt?'))return;\
+         showMsg('Eszköz újraindítása...',false);try{{await fetch('/restart',{{method:'POST'}});}}catch(_){{}}}}\
+         async function toggleLamp(){{const r=await fetch('/toggle-lamp',{{method:'POST'}});const d=await r.json();\
+         if(d.ok){{updateLampUi(d.lamp_is_on);showMsg(d.lamp_is_on?'Lámpa BEKAPCSOLVA (P2).':'Lámpa KIKAPCSOLVA.',false);}}\
+         else{{showMsg(d.error||'Előbb mentsd el a 4 konfigurációs paramétert!',true);}}}}\
+         async function saveConfig(e){{e.preventDefault();\
+         const payload={{threshold:+document.getElementById('threshold').value,duration:+document.getElementById('duration').value,\
+         sensitivity:+document.getElementById('sensitivity').value,delay:+document.getElementById('delay').value}};\
+         if(!payload.threshold||!payload.duration||!payload.sensitivity||!payload.delay){{showMsg('Minden paraméternek 0-tól különbözőnek kell lennie!',true);return;}}\
+         const r=await fetch('/save-config',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});\
+         const d=await r.json();if(d.ok){{showMsg(d.saved_to_flash?'Konfiguráció mentve az NVS memóriába.':'Konfiguráció változatlan (NVS írás kihagyva).',false);}}\
+         else{{showMsg('Érvénytelen konfigurációs értékek!',true);}}}}\
+         </script></body></html>",
+        rem = init_rem_js
+    );
+
     html
 }
 
-/// HTTP server on port 80 that serves the portal and returns once valid credentials are saved.
+async fn send_http_response(
+    socket: &mut TcpSocket<'_>,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) {
+    let mut hdr = String::new();
+    let _ = write!(
+        hdr,
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+        status,
+        content_type,
+        body.len()
+    );
+    let _ = socket.write_all(hdr.as_bytes()).await;
+    let _ = socket.write_all(body.as_bytes()).await;
+    let _ = socket.flush().await;
+}
+
+async fn remaining_ap_secs(
+    ap_deadline: &EmbassyMutex<CriticalSectionRawMutex, Option<Instant>>,
+) -> Option<u64> {
+    let dl_opt = *ap_deadline.lock().await;
+    dl_opt.map(|dl| {
+        let now = Instant::now();
+        if dl > now {
+            dl.duration_since(now).as_secs()
+        } else {
+            0
+        }
+    })
+}
+
+/// Scans nearby Wi-Fi networks using the Wi-Fi controller in AP+STA mode.
+async fn scan_nearby_ssids(controller: &mut WifiController<'_>) -> Vec<String> {
+    let mut ssids: Vec<String> = Vec::new();
+    if let Ok(Ok(results)) = with_timeout(
+        Duration::from_secs(8),
+        controller.scan_async(&ScanConfig::default().with_max(15)),
+    )
+    .await
+    {
+        for ap in results {
+            let s = ap.ssid.as_str();
+            if !s.is_empty() && !ssids.iter().any(|x| x == s) {
+                ssids.push(String::from(s));
+            }
+        }
+    }
+    ssids
+}
+
+/// HTTP server on port 80 serving the two-view Captive Portal and all provisioning/config endpoints.
 async fn http_portal_server(
     stack: Stack<'_>,
+    controller: &mut WifiController<'_>,
     flash: &mut FlashStorage<'_>,
-    portal_html: &str,
+    device_name: &str,
+    initial_ssids: Vec<String>,
+    ap_deadline: &EmbassyMutex<CriticalSectionRawMutex, Option<Instant>>,
+    last_wifi_error: &mut bool,
 ) -> WifiCredentials {
     let mut rx_buf = [0u8; 2048];
-    let mut tx_buf = [0u8; 2048];
+    let mut tx_buf = [0u8; 4096];
+    let mut cached_ssids = initial_ssids;
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
@@ -543,7 +855,7 @@ async fn http_portal_server(
             continue;
         }
 
-        let mut req_buf = [0u8; 1536];
+        let mut req_buf = [0u8; 2048];
         let mut total = 0usize;
         let mut payload_too_large = false;
         loop {
@@ -596,53 +908,217 @@ async fn http_portal_server(
             continue;
         }
 
-        if payload_too_large {
-            println!(
-                "HTTP payload exceeded {} bytes; dropping connection.",
-                MAX_POST_BODY_BYTES
-            );
-            socket.close();
-            continue;
-        }
-
         if let Ok(req_str) = core::str::from_utf8(&req_buf[..total]) {
-            if req_str.starts_with("POST ") {
-                let body = req_str.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
-                if body.len() > MAX_POST_BODY_BYTES {
-                    socket.close();
-                    continue;
+            let first_line = req_str.lines().next().unwrap_or("");
+            let mut parts = first_line.split_whitespace();
+            let method = parts.next().unwrap_or("GET");
+            let raw_path = parts.next().unwrap_or("/");
+            let path = raw_path.split('?').next().unwrap_or("/");
+            let body = req_str.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+
+            match (method, path) {
+                ("GET", "/status") => {
+                    let rem = remaining_ap_secs(ap_deadline).await;
+                    let nvs = load_nvs_data(flash);
+                    let saved_ssid = nvs.wifi.as_ref().map(|w| w.ssid.as_str()).unwrap_or("");
+                    let state = DEVICE_STATE.lock().await;
+                    let status = PortalStatusJson {
+                        device_name,
+                        limitless: rem.is_none(),
+                        remaining_secs: rem,
+                        has_saved_wifi: nvs.wifi.is_some(),
+                        saved_ssid,
+                        last_wifi_error: *last_wifi_error,
+                        configured: state.is_configured(),
+                        lamp_is_on: state.lamp_is_on,
+                        remote_lamp_on: state.remote_lamp_on,
+                        threshold: state.threshold,
+                        duration: state.duration,
+                        sensitivity: state.sensitivity,
+                        delay: state.delay,
+                    };
+                    drop(state);
+                    let json = serde_json::to_string(&status).unwrap_or_else(|_| String::from("{}"));
+                    send_http_response(&mut socket, "200 OK", "application/json", &json).await;
                 }
-                if let Some(creds) = parse_credentials_form(body) {
-                    println!("Saving credentials for SSID '{}'...", creds.ssid);
-                    if save_credentials(flash, &creds).is_ok() {
-                        let resp_body = "<!DOCTYPE html><html><body><h2>Saved!</h2><p>Connecting to Wi-Fi...</p></body></html>";
-                        let mut hdr = String::new();
-                        let _ = write!(
-                            hdr,
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            resp_body.len()
+                ("GET", "/scan") => {
+                    let fresh = scan_nearby_ssids(controller).await;
+                    if !fresh.is_empty() {
+                        cached_ssids = fresh;
+                    }
+                    let json =
+                        serde_json::to_string(&cached_ssids).unwrap_or_else(|_| String::from("[]"));
+                    send_http_response(&mut socket, "200 OK", "application/json", &json).await;
+                }
+                ("POST", "/connect-wifi") | ("POST", "/save") => {
+                    if let Some(creds) = parse_wifi_submit(body) {
+                        println!(
+                            "PORTAL: Received candidate Wi-Fi '{}' (Verify-Before-Save, not written to NVS yet).",
+                            creds.ssid
                         );
-                        let _ = socket.write_all(hdr.as_bytes()).await;
-                        let _ = socket.write_all(resp_body.as_bytes()).await;
-                        let _ = socket.flush().await;
+                        let resp = "{\"ok\":true,\"verifying\":true}";
+                        send_http_response(&mut socket, "200 OK", "application/json", resp).await;
                         socket.close();
-                        Timer::after(Duration::from_millis(300)).await;
+                        Timer::after(Duration::from_millis(350)).await;
                         return creds;
                     }
+                    send_http_response(
+                        &mut socket,
+                        "400 Bad Request",
+                        "application/json",
+                        "{\"ok\":false,\"error\":\"Érvénytelen SSID vagy jelszó\"}",
+                    )
+                    .await;
                 }
-                let err_resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 19\r\nConnection: close\r\n\r\nInvalid credentials";
-                let _ = socket.write_all(err_resp.as_bytes()).await;
-            } else {
-                let mut hdr = String::new();
-                let _ = write!(
-                    hdr,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    portal_html.len()
-                );
-                let _ = socket.write_all(hdr.as_bytes()).await;
-                let _ = socket.write_all(portal_html.as_bytes()).await;
+                ("POST", "/clear-wifi") => {
+                    let mut nvs = load_nvs_data(flash);
+                    {
+                        let state = DEVICE_STATE.lock().await;
+                        nvs.config = DeviceConfig {
+                            threshold: state.threshold,
+                            duration: state.duration,
+                            sensitivity: state.sensitivity,
+                            delay: state.delay,
+                        };
+                    }
+                    nvs.wifi = None;
+                    let _ = save_nvs_data(flash, &nvs);
+                    *last_wifi_error = false;
+                    {
+                        let mut dl = ap_deadline.lock().await;
+                        *dl = None;
+                    }
+                    println!("PORTAL: Saved Wi-Fi cleared from NVS; switched AP to limitless mode.");
+                    send_http_response(
+                        &mut socket,
+                        "200 OK",
+                        "application/json",
+                        "{\"ok\":true,\"limitless\":true}",
+                    )
+                    .await;
+                }
+                ("POST", "/restart") => {
+                    println!("PORTAL: Software reset requested by user.");
+                    send_http_response(
+                        &mut socket,
+                        "200 OK",
+                        "application/json",
+                        "{\"ok\":true,\"restarting\":true}",
+                    )
+                    .await;
+                    socket.close();
+                    Timer::after(Duration::from_millis(300)).await;
+                    esp_hal::system::software_reset();
+                }
+                ("POST", "/toggle-lamp") => {
+                    let (configured, new_remote) = {
+                        let mut state = DEVICE_STATE.lock().await;
+                        if !state.is_configured() {
+                            (false, false)
+                        } else {
+                            state.remote_lamp_on = !state.remote_lamp_on;
+                            (true, state.remote_lamp_on)
+                        }
+                    };
+                    if !configured {
+                        send_http_response(
+                            &mut socket,
+                            "400 Bad Request",
+                            "application/json",
+                            "{\"ok\":false,\"lamp_is_on\":false,\"error\":\"Előbb állítsd be és mentsd el a 4 konfigurációs paramétert (nem 0 értékekkel)!\"}",
+                        )
+                        .await;
+                    } else {
+                        // Allow 100ms relay_state_machine_task tick to apply P2 transition & safety timer.
+                        Timer::after(Duration::from_millis(150)).await;
+                        let lamp_is_on = {
+                            let state = DEVICE_STATE.lock().await;
+                            state.lamp_is_on
+                        };
+                        let resp = alloc::format!(
+                            "{{\"ok\":true,\"lamp_is_on\":{},\"remote_lamp_on\":{}}}",
+                            lamp_is_on, new_remote
+                        );
+                        send_http_response(&mut socket, "200 OK", "application/json", &resp).await;
+                    }
+                }
+                ("POST", "/save-config") => {
+                    if let Some(new_cfg) = parse_config_submit(body) {
+                        let changed = {
+                            let mut state = DEVICE_STATE.lock().await;
+                            let prev = DeviceConfig {
+                                threshold: state.threshold,
+                                duration: state.duration,
+                                sensitivity: state.sensitivity,
+                                delay: state.delay,
+                            };
+                            state.threshold = new_cfg.threshold;
+                            state.duration = new_cfg.duration;
+                            state.sensitivity = new_cfg.sensitivity;
+                            state.delay = new_cfg.delay;
+                            prev != new_cfg
+                        };
+                        if changed {
+                            let mut nvs = load_nvs_data(flash);
+                            nvs.config = new_cfg;
+                            let _ = save_nvs_data(flash, &nvs);
+                            println!(
+                                "PORTAL: Config updated and saved to NVS (threshold={}, duration={}, sensitivity={}, delay={}).",
+                                new_cfg.threshold, new_cfg.duration, new_cfg.sensitivity, new_cfg.delay
+                            );
+                        } else {
+                            println!("PORTAL: Config unchanged; skipped NVS write.");
+                        }
+                        let resp = alloc::format!(
+                            "{{\"ok\":true,\"saved_to_flash\":{},\"configured\":true}}",
+                            changed
+                        );
+                        send_http_response(&mut socket, "200 OK", "application/json", &resp).await;
+                    } else {
+                        send_http_response(
+                            &mut socket,
+                            "400 Bad Request",
+                            "application/json",
+                            "{\"ok\":false,\"error\":\"Minden paraméternek 0-tól különböző érvényes számnak kell lennie\"}",
+                        )
+                        .await;
+                    }
+                }
+                _ => {
+                    let rem = remaining_ap_secs(ap_deadline).await;
+                    let nvs = load_nvs_data(flash);
+                    let (cfg, lamp_is_on) = {
+                        let state = DEVICE_STATE.lock().await;
+                        (
+                            DeviceConfig {
+                                threshold: state.threshold,
+                                duration: state.duration,
+                                sensitivity: state.sensitivity,
+                                delay: state.delay,
+                            },
+                            state.lamp_is_on,
+                        )
+                    };
+                    let initial_view = if path == "/config" { "config" } else { "main" };
+                    let html = build_portal_html(
+                        device_name,
+                        &cached_ssids,
+                        initial_view,
+                        rem,
+                        *last_wifi_error,
+                        cfg,
+                        lamp_is_on,
+                        nvs.wifi.as_ref().map(|w| w.ssid.as_str()),
+                    );
+                    send_http_response(
+                        &mut socket,
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        &html,
+                    )
+                    .await;
+                }
             }
-            let _ = socket.flush().await;
         }
         socket.close();
     }
@@ -697,7 +1173,6 @@ const BH1750_CMD_CONT_HIGH_RES: u8 = 0x10;
 const SENSOR_POLL_INTERVAL_SECS: u64 = 1;
 const RELAY_TICK_MS: u64 = 100;
 const SAFETY_OFF_SEC: u64 = 3600;
-const SIMULATE_HARDWARE: bool = true;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 enum LampOnSource {
@@ -907,17 +1382,14 @@ async fn pairing_test_task(stack: Stack<'static>, seed: u64) {
 }
 
 /// Reads ambient light (in lux) from the BH1750 sensor over async I2C and updates `DEVICE_STATE`.
-/// When `SIMULATE_HARDWARE` is true, `simulation_stimulus_task` drives `current_lux` directly.
+/// When `i2c_opt` is `None`, waits idly until physical I2C pins are wired in a future revision.
 #[embassy_executor::task]
 async fn sensor_task(i2c_opt: Option<I2c<'static, Async>>) -> ! {
-    if SIMULATE_HARDWARE {
-        let _ = i2c_opt;
+    let Some(mut i2c) = i2c_opt else {
         loop {
             Timer::after(Duration::from_secs(3600)).await;
         }
-    }
-
-    let mut i2c = i2c_opt.expect("I2C must be initialized when SIMULATE_HARDWARE is false");
+    };
     let mut initialized = false;
 
     loop {
@@ -1136,14 +1608,8 @@ fn set_relay_output(
     state: &mut DeviceState,
     on: bool,
 ) {
+    let _ = pir_relay_opt;
     state.lamp_is_on = on;
-    if !SIMULATE_HARDWARE && let Some((_, relay)) = pir_relay_opt.as_mut() {
-        if on {
-            relay.set_high();
-        } else {
-            relay.set_low();
-        }
-    }
 }
 
 /// Non-blocking 100 ms offline-resilient state machine enforcing P1/P2/P3 relay priorities.
@@ -1151,7 +1617,6 @@ fn set_relay_output(
 async fn relay_state_machine_task(
     mut pir_relay_opt: Option<(Input<'static>, Output<'static>)>,
 ) -> ! {
-    let mut tick_count: u32 = 0;
     let mut prev_pir_active = false;
 
     loop {
@@ -1160,35 +1625,11 @@ async fn relay_state_machine_task(
         let now = Instant::now();
         let mut state = DEVICE_STATE.lock().await;
 
-        let pir_active = if SIMULATE_HARDWARE {
-            state.simulated_pir
-        } else {
-            let (pir, _) = pir_relay_opt
-                .as_ref()
-                .expect("PIR and Relay GPIOs must be initialized when SIMULATE_HARDWARE is false");
+        let pir_active = if let Some((pir, _)) = pir_relay_opt.as_ref() {
             pir.is_high()
+        } else {
+            state.simulated_pir
         };
-
-        tick_count = tick_count.wrapping_add(1);
-        if SIMULATE_HARDWARE && tick_count.is_multiple_of(20) {
-            let p2_elapsed = state
-                .p2_turned_on_at
-                .map_or(0, |ts| now.duration_since(ts).as_secs());
-            let idle_elapsed = state
-                .last_movement_ts
-                .map_or(0, |ts| now.duration_since(ts).as_secs());
-            println!(
-                "STATUS: cfg={} | lux={} | pir={} | lamp={} | src={:?} | p2={} | p2_elapsed={}s | idle_elapsed={}s",
-                state.is_configured(),
-                state.current_lux,
-                pir_active,
-                state.lamp_is_on,
-                state.lamp_on_source,
-                state.remote_lamp_on,
-                p2_elapsed,
-                idle_elapsed
-            );
-        }
 
         // Gate check: do not run P1/P2/P3 automation while any core parameter is 0.
         if !state.is_configured() {
@@ -1255,7 +1696,7 @@ async fn relay_state_machine_task(
                 }
             } else if state.lamp_on_source == LampOnSource::SensorP3 {
                 state.last_movement_ts = Some(now);
-                if SIMULATE_HARDWARE && !prev_pir_active {
+                if !prev_pir_active {
                     println!("[P3 MOTION] PIR active while Lamp ON -> duration timer refreshed");
                 }
             }
@@ -1356,14 +1797,15 @@ async fn ntp_task(stack: Stack<'static>) -> ! {
     }
 }
 
-/// Attempts to connect as Station and acquire a DHCPv4 IP address with configured hostname.
-async fn try_connect_sta(
+/// Attempts to connect as Station and acquire a DHCPv4 IP address within ~15-20s.
+/// Returns `true` only if both Wi-Fi association and DHCP IP acquisition succeed.
+async fn connect_sta_with_timeout(
     stack: Stack<'static>,
     controller: &mut WifiController<'_>,
     creds: &WifiCredentials,
 ) -> bool {
     let Some(sta_cfg) = station_config_from_creds(creds) else {
-        println!("Invalid stored Wi-Fi credentials format.");
+        println!("Invalid Wi-Fi credentials format.");
         return false;
     };
 
@@ -1374,8 +1816,8 @@ async fn try_connect_sta(
 
     println!("Connecting to Wi-Fi SSID '{}'...", creds.ssid);
     let mut connected = false;
-    for attempt in 1..=3 {
-        match with_timeout(Duration::from_secs(12), controller.connect_async()).await {
+    for attempt in 1..=2 {
+        match with_timeout(Duration::from_secs(7), controller.connect_async()).await {
             Ok(Ok(_)) => {
                 connected = true;
                 break;
@@ -1383,30 +1825,34 @@ async fn try_connect_sta(
             Ok(Err(e)) => println!("Connect attempt {} failed: {:?}", attempt, e),
             Err(_) => println!("Connect attempt {} timed out.", attempt),
         }
-        Timer::after(Duration::from_millis(500)).await;
+        Timer::after(Duration::from_millis(300)).await;
     }
 
     if !connected {
+        let _ = controller.disconnect_async().await;
         return false;
     }
 
     println!("Wi-Fi associated! Waiting for DHCP lease...");
 
-    if with_timeout(Duration::from_secs(15), stack.wait_config_up())
+    if with_timeout(Duration::from_secs(6), stack.wait_config_up())
         .await
         .is_err()
     {
         println!("DHCP timed out.");
+        let _ = controller.disconnect_async().await;
         return false;
     }
 
-    let gateway = if let Some(cfg) = stack.config_v4() {
+    if let Some(cfg) = stack.config_v4() {
         println!("Acquired IP address: {}", cfg.address.address());
-        cfg.gateway
-    } else {
-        None
-    };
-    set_led_state(LedState::Connected);
+    }
+    true
+}
+
+/// Runs periodic gateway ICMP keep-alive pings in Normal Online Mode.
+async fn sta_online_keepalive(stack: Stack<'static>) -> ! {
+    let gateway = stack.config_v4().and_then(|cfg| cfg.gateway);
 
     let mut icmp_rx_meta = [IcmpPacketMetadata::EMPTY; 1];
     let mut icmp_tx_meta = [IcmpPacketMetadata::EMPTY; 1];
@@ -1414,13 +1860,8 @@ async fn try_connect_sta(
     let mut icmp_tx_buf = [0u8; 128];
 
     loop {
-        println!(
-            "Keep-alive: starting {}s timer before next gateway ping...",
-            KEEPALIVE_INTERVAL_SECS
-        );
         Timer::after(Duration::from_secs(KEEPALIVE_INTERVAL_SECS)).await;
         if let Some(gw) = gateway {
-            println!("Keep-alive: sending ICMP ping to gateway {}...", gw);
             let mut ping_mgr = PingManager::new(
                 stack,
                 &mut icmp_rx_meta,
@@ -1443,32 +1884,35 @@ async fn try_connect_sta(
     }
 }
 
-/// Runs WPA2-protected SoftAP mode with optional timeout; returns submitted credentials if any.
+/// Polls until the optional AP deadline expires (or waits forever if `None` / limitless).
+async fn wait_ap_deadline(
+    ap_deadline: &EmbassyMutex<CriticalSectionRawMutex, Option<Instant>>,
+) {
+    loop {
+        if let Some(dl) = *ap_deadline.lock().await
+            && Instant::now() >= dl
+        {
+            return;
+        }
+        Timer::after(Duration::from_millis(250)).await;
+    }
+}
+
+/// Runs WPA2-protected SoftAP + STA scan coex with optional dynamic countdown timeout.
 async fn run_captive_portal(
     controller: &mut WifiController<'_>,
     flash: &mut FlashStorage<'_>,
     device_name: &str,
     seed: u64,
     timeout: Option<Duration>,
-) -> Option<WifiCredentials> {
-    set_led_state(LedState::ApMode);
-
+    last_wifi_error: &mut bool,
+) -> PortalOutcome {
     let mut scanned_ssids: Vec<String> = Vec::new();
     if controller
         .set_config(&Config::Station(StationConfig::default()))
         .is_ok()
     {
-        if let Ok(results) = controller
-            .scan_async(&ScanConfig::default().with_max(12))
-            .await
-        {
-            for ap in results {
-                let s = ap.ssid.as_str();
-                if !s.is_empty() && !scanned_ssids.iter().any(|x| x == s) {
-                    scanned_ssids.push(String::from(s));
-                }
-            }
-        }
+        scanned_ssids = scan_nearby_ssids(controller).await;
     }
     println!(
         "Found {} Wi-Fi networks for portal list.",
@@ -1481,7 +1925,10 @@ async fn run_captive_portal(
             FACTORY_PASSKEY.try_into().expect("valid AP password"),
         ));
     controller
-        .set_config(&Config::AccessPoint(ap_cfg))
+        .set_config(&Config::AccessPointStation(
+            StationConfig::default(),
+            ap_cfg,
+        ))
         .expect("Failed to start SoftAP");
 
     let ap_iface = Interface::access_point();
@@ -1494,28 +1941,29 @@ async fn run_captive_portal(
     let (stack, mut runner) = embassy_net::new(ap_iface, net_cfg, &mut resources, seed);
 
     println!(
-        "SoftAP '{}' (WPA2 pass: '{}') active at http://{}/",
-        device_name, FACTORY_PASSKEY, AP_IP
+        "SoftAP '{}' (WPA2 pass: '{}') active at http://{}/ (timeout: {:?})",
+        device_name, FACTORY_PASSKEY, AP_IP, timeout
     );
 
-    let portal_html = build_portal_html(&scanned_ssids);
-
+    let ap_deadline = EmbassyMutex::new(timeout.map(|d| Instant::now() + d));
     let portal_future = select4(
         runner.run(),
         dhcp_server(stack),
         dns_server(stack),
-        http_portal_server(stack, flash, &portal_html),
+        http_portal_server(
+            stack,
+            controller,
+            flash,
+            device_name,
+            scanned_ssids,
+            &ap_deadline,
+            last_wifi_error,
+        ),
     );
 
-    match timeout {
-        Some(dur) => match with_timeout(dur, portal_future).await {
-            Ok(Either4::Fourth(creds)) => Some(creds),
-            _ => None,
-        },
-        None => match portal_future.await {
-            Either4::Fourth(creds) => Some(creds),
-            _ => None,
-        },
+    match select(portal_future, wait_ap_deadline(&ap_deadline)).await {
+        Either::First(Either4::Fourth(creds)) => PortalOutcome::ConnectWifi(creds),
+        _ => PortalOutcome::TimeoutExpired,
     }
 }
 
@@ -1528,26 +1976,21 @@ async fn main(spawner: Spawner) {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
-    spawner.spawn(led_task(peripherals.RMT, peripherals.GPIO48).expect("led_task spawn"));
+    let mut flash = FlashStorage::new(peripherals.FLASH);
+    let nvs_data = load_nvs_data(&mut flash);
+    {
+        let mut state = DEVICE_STATE.lock().await;
+        state.threshold = nvs_data.config.threshold;
+        state.duration = nvs_data.config.duration;
+        state.sensitivity = nvs_data.config.sensitivity;
+        state.delay = nvs_data.config.delay;
+    }
 
-    let (i2c_opt, pir_relay_opt) = if SIMULATE_HARDWARE {
-        spawner.spawn(simulation_stimulus_task().expect("simulation_stimulus_task spawn"));
-        (None, None)
-    } else {
-        let pir = Input::new(
-            peripherals.GPIO4,
-            InputConfig::default().with_pull(Pull::Down),
-        );
-        let relay = Output::new(peripherals.GPIO5, Level::Low, OutputConfig::default());
-        let i2c = I2c::new(peripherals.I2C0, I2cConfig::default())
-            .expect("I2C0 init failed")
-            .with_sda(peripherals.GPIO8)
-            .with_scl(peripherals.GPIO9)
-            .into_async();
-        (Some(i2c), Some((pir, relay)))
-    };
-    spawner.spawn(sensor_task(i2c_opt).expect("sensor_task spawn"));
-    spawner.spawn(relay_state_machine_task(pir_relay_opt).expect("relay_state_machine_task spawn"));
+    // Hardware Safety: do not drive physical relay/sensor GPIO pins yet; only WS2812 mirrors lamp_is_on.
+    // simulation_stimulus_task is intentionally not spawned so real Captive Portal & state machine interactions run undisturbed.
+    spawner.spawn(led_task(peripherals.RMT, peripherals.GPIO48).expect("led_task spawn"));
+    spawner.spawn(sensor_task(None).expect("sensor_task spawn"));
+    spawner.spawn(relay_state_machine_task(None).expect("relay_state_machine_task spawn"));
 
     let rng = Rng::new();
     let seed = ((rng.random() as u64) << 32) | (rng.random() as u64);
@@ -1555,7 +1998,6 @@ async fn main(spawner: Spawner) {
     let device_name = build_device_name();
     println!("Device identity: {}", device_name);
 
-    let mut flash = FlashStorage::new(peripherals.FLASH);
     let mut controller =
         WifiController::new(peripherals.WIFI, Default::default()).expect("Wi-Fi init failed");
 
@@ -1572,37 +2014,78 @@ async fn main(spawner: Spawner) {
     spawner.spawn(ntp_task(sta_stack).expect("ntp_task spawn"));
     spawner.spawn(pairing_test_task(sta_stack, seed).expect("pairing_test_task spawn"));
 
-    println!(
-        "Starting {}-second SoftAP configuration window...",
-        AP_BOOT_WINDOW_SECS
-    );
-    let mut active_creds = run_captive_portal(
-        &mut controller,
-        &mut flash,
-        &device_name,
-        seed,
-        Some(Duration::from_secs(AP_BOOT_WINDOW_SECS)),
-    )
-    .await;
+    let mut ap_timeout = if nvs_data.config.is_configured() && nvs_data.wifi.is_some() {
+        println!(
+            "BOOT Case 3 (Configured + Saved Wi-Fi): Starting {}-second timed AP window.",
+            AP_BOOT_WINDOW_SECS
+        );
+        Some(Duration::from_secs(AP_BOOT_WINDOW_SECS))
+    } else if !nvs_data.config.is_configured() {
+        println!("BOOT Case 1 (Virgin / Unconfigured): Relay inactive; starting limitless AP.");
+        None
+    } else {
+        println!("BOOT Case 2 (Configured, no Wi-Fi): Relay active; starting limitless AP.");
+        None
+    };
 
-    if active_creds.is_none() {
-        println!("60s AP window expired; checking NVS for saved credentials...");
-        active_creds = load_credentials(&mut flash);
-    }
+    let mut last_wifi_error = false;
 
     loop {
-        if let Some(creds) = active_creds.take() {
-            set_led_state(LedState::Connecting);
-            if !try_connect_sta(sta_stack, &mut controller, &creds).await {
-                println!("STA connection failed; falling back to SoftAP provisioning.");
-                set_led_state(LedState::Error);
-                Timer::after(Duration::from_secs(2)).await;
-            }
-        } else {
-            println!("No valid Wi-Fi credentials; starting SoftAP provisioning indefinitely.");
-        }
+        let outcome = run_captive_portal(
+            &mut controller,
+            &mut flash,
+            &device_name,
+            seed,
+            ap_timeout,
+            &mut last_wifi_error,
+        )
+        .await;
 
-        active_creds =
-            run_captive_portal(&mut controller, &mut flash, &device_name, seed, None).await;
+        match outcome {
+            PortalOutcome::ConnectWifi(candidate_creds) => {
+                if connect_sta_with_timeout(sta_stack, &mut controller, &candidate_creds).await {
+                    let cur_cfg = {
+                        let state = DEVICE_STATE.lock().await;
+                        DeviceConfig {
+                            threshold: state.threshold,
+                            duration: state.duration,
+                            sensitivity: state.sensitivity,
+                            delay: state.delay,
+                        }
+                    };
+                    let updated = NvsData {
+                        config: cur_cfg,
+                        wifi: Some(candidate_creds),
+                    };
+                    if save_nvs_data(&mut flash, &updated).is_ok() {
+                        println!("Verify-Before-Save: Wi-Fi verified and saved to NVS.");
+                    } else {
+                        println!("Verify-Before-Save: Wi-Fi connected, but NVS write failed.");
+                    }
+                    sta_online_keepalive(sta_stack).await;
+                } else {
+                    println!(
+                        "Verify-Before-Save: Wi-Fi connection failed; NVS untouched. Returning to limitless AP."
+                    );
+                    last_wifi_error = true;
+                    ap_timeout = None;
+                }
+            }
+            PortalOutcome::TimeoutExpired => {
+                let latest_nvs = load_nvs_data(&mut flash);
+                if let Some(saved_creds) = latest_nvs.wifi {
+                    println!("300s AP window expired; connecting to saved Wi-Fi...");
+                    if connect_sta_with_timeout(sta_stack, &mut controller, &saved_creds).await {
+                        sta_online_keepalive(sta_stack).await;
+                    } else {
+                        println!("Saved Wi-Fi connection failed; falling back to limitless AP.");
+                        last_wifi_error = true;
+                        ap_timeout = None;
+                    }
+                } else {
+                    ap_timeout = None;
+                }
+            }
+        }
     }
 }
