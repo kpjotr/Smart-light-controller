@@ -10,8 +10,8 @@ Ipari megbízhatóságú, **100%-ban offline-tűrő (offline-resilient)** okos v
 
 ## Projekt Áttekintés & Architektúra
 
-- **Offline-Resilient Működés:** Minden belső állapotgép- és biztonsági időzítő (`embassy_time::Instant` és `Duration`) kizárólag hardveres monotonic órára épül; a lámpavezérlés és a szenzoros automatika teljesen független a Wi-Fi-től és az NTP időszinkrontól.
-- **Könnyűsúlyú Felhő Kommunikáció:** A memóriaintenzív Firebase Auth/Firestore kliens SDK helyett az ESP32 közvetlen **HTTPS POST** kérésekkel (`reqwless` + `embedded-tls`, `TLS_RX_BUF_LEN = 16640`, `TLS_TX_BUF_LEN = 16640`) kommunikál a Cloud Functions v2 végpontokkal.
+- **Offline-Resilient Működés:** Minden belső állapotgép- és biztonsági időzítő (`embassy_time::Instant` és `Duration`) kizárólag hardveres monotonic órára épül; a lámpavezérlés, a szenzoros automatika és az energiamérés (`pending_energy_sec`) teljesen független a Wi-Fi-től és az NTP időszinkrontól.
+- **Valós Idejű Felhő Kommunikáció (Firebase Auth + RTDB SSE):** Az ESP32 TLS 1.2/1.3 kapcsolaton (`reqwless` + `embedded-tls`, `TLS_RX_BUF_LEN = 16640`, `TLS_TX_BUF_LEN = 16640`, statikus `.bss` pufferek) keresztül Firebase Custom Token / Refresh Token hitelesítéssel, valamint kétirányú **Firebase Realtime Database (RTDB) REST + Server-Sent Events (SSE)** csatornával kommunikál.
 
 ---
 
@@ -55,9 +55,13 @@ Az állapotgép (`relay_state_machine_task`) három prioritási szinten vezérli
 
 ---
 
-## Boot Életciklus, Scan-Before-Countdown & Verify-Before-Save NVS (`SLN2`)
+## Boot Életciklus, Scan-Before-Countdown & Verify-Before-Save NVS (`SLN3`)
 
-- **CRC-védett NVS rekord (`SLN2`):** Az NVS partíció 128 bájtos, FNV-1a ellenőrzőösszeggel védett (`SLN2`, `v3`) rekordjában tárolódik a 4 működési paraméter (`threshold`, `sensitivity`, `duration`, `safety_off_min`) és legfeljebb **1 db** Wi-Fi hitelesítő adatpár (`wifi_ssid`, `wifi_pass`; új mentése felülírja a korábbit).
+- **CRC32-védett NVS rekord (`SLN3`, 512 bájt):** Az NVS partíció 512 bájtos, IEEE CRC32 ellenőrzőösszeggel (`buf[508..512]`) védett (`SLN3`, `v4`) rekordjában tárolódik:
+  - a 4 működési paraméter (`threshold`, `sensitivity`, `duration`, `safety_off_min`),
+  - legfeljebb **1 db** Wi-Fi hitelesítő adatpár (`wifi_ssid` max. 32B, `wifi_pass` max. 64B), valamint
+  - a Firebase Auth `refresh_token` (`[u8; 320]` + `refresh_token_len: u16` a `124..444` bájttartományban).
+  - **Automatikus migráció:** Korábbi `SLN2` (128 bájtos, FNV-1a védett) rekord észlelésekor a firmware automatikusan átmigrálja a konfigurációt és a Wi-Fi adatokat `SLN3` formátumba (`refresh_token_len = 0`).
 - **Boot Életciklus és Scan-Before-Countdown:**
   - **Konfigurálatlan (`!is_configured()`) vagy mentett Wi-Fi nélküli állapot:** A P3 automatika inaktív (szűz állapotban, de a P2 kézi lámpakapcsolás ekkor is működik!), a WPA2-védett SoftAP + Captive Portal **időkorlát nélkül (limitless)** fut.
   - **Konfigurált (`is_configured() == true`) és van mentett `wifi_ssid` az NVS-ben:** Induláskor az ESP32 `AccessPointStation` módban azonnal végez egy kezdeti Wi-Fi környezeti keresést (`scan_nearby_ssids`), és ellenőrzi, hogy a mentett SSID valóban elérhető-e (`saved_ssid_visible`).
@@ -96,11 +100,24 @@ Konfigurálatlan eszköz esetén az alábbi alapértelmezett értékekkel tölti
 
 ---
 
-## 5 Perces Felhő Párosítási Ablak (`verifyPairing`)
+## Felhő Hitelesítés (Custom Token / Refresh Token) és RTDB SSE Architektúra
 
-- Sikeres Wi-Fi csatlakozás és DHCP IP-cím szerzése után az ESP32 megnyit egy **5 perces (`PAIRING_WINDOW_SECS = 300`)** párosítási ablakot, és periodikusan (`10s` időközönként) POST kérést küld a `verifyPairing` Cloud Function végpontra a `deviceId`, `pin` (`FACTORY_PASSKEY`) és `espUid` adatokkal.
-- **Sikeres párosítás (`HTTP 200`):** A párosítási folyamat azonnal leáll.
-- **Többfiókos (Multi-Account) támogatás:** Egy **Hard Reset** vagy **Újraindítás (`Restart`)** végrehajtásával az 5 perces párosítási ablak bármikor újra megnyitható újabb felhasználói fiók hozzárendeléséhez.
+1. **Párosítás és Firebase Auth Életciklus (`auth_task`):**
+   - **Párosítatlan állapot (`refresh_token_len == 0`):** Wi-Fi + DHCP csatlakozás után megnyílik az **5 perces (`PAIRING_WINDOW_SECS = 300`)** `verifyPairing` polling ablak (`deviceId`, `pin` = `FACTORY_PASSKEY`, `espUid`). Sikeres `HTTP 200` válaszból kiolvassa a `customToken`-t, majd az `identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken` végponton kicseréli **RAM-beli `id_token`-re** (max. 1536B) és **NVS `SLN3`-ba mentett `refresh_token`-re** (max. 320B).
+   - **Párosított állapot (`refresh_token_len > 0`):** Induláskor és többórás offline kiesés után a firmware átugorja a `verifyPairing` pollingot, és a `securetoken.googleapis.com/v1/token` végponton (`application/x-www-form-urlencoded`) azonnal frissíti az `id_token`-t (valamint az esetlegesen rotált `refresh_token`-t).
+   - **Automatikus megújítás és leválasztás-kezelés:** Az `id_token` online módban **45 percenként (`2700s`)**, hálózat-helyreálláskor, vagy RTDB `HTTP 401/403` esetén automatikusan megújul. Visszavont token (`400/401/403` vagy ismételt RTDB `401/403` / `auth_revoked`) esetén az NVS `refresh_token` törlődik (`len = 0`), és az eszköz visszalép az 5 perces `verifyPairing` ablakba.
+   - **Többfiókos (Multi-Account) támogatás:** Hard Reset vagy Újraindítás (`Restart`) esetén a meglévő `refresh_token` törlése nélkül vagy új fiókkal is támogatott a felhő szinkron; párosítatlan eszközön az 5 perces ablak újraindítással bármikor újranyitható.
+
+2. **Élő Parancsfigyelés – RTDB SSE (`rtdb_sse_listener_task`):**
+   - Tartós TLS + HTTP/1.1 `GET /live/<deviceId>/cmd.json?auth=<id_token>` (`Accept: text/event-stream`) kapcsolatot tart fenn a `okospilacsvezerlo-default-rtdb.europe-west1.firebasedatabase.app` szerverrel (chunked és SSE soronkénti feldolgozással).
+   - Feldolgozza a `put`, `patch`, `keep-alive`, `cancel` és `auth_revoked` eseményeket (`/` és mezőszintű útvonalakhoz egyaránt).
+   - A `lamp` parancs azonnal RAM-ba íródik (`remote_lamp_on`, **0 NVS írás**); a `thr`, `sens`, `dur`, `safe` paraméterek tartomány-ellenőrzés után **kizárólag tényleges változás esetén** íródnak az `SLN3` NVS-be; `restart: true` esetén `{"restart":false}` PATCH után `500 ms` múlva szoftveres újraindítást hajt végre.
+   - Kapcsolatvesztéskor exponenciális backoff-fal (`2s -> 5s -> 10s -> 20s -> 30s`) csatlakozik újra, tokenfrissítéskor pedig azonnal újranyitja a streamet.
+
+3. **Állapot- és Energia-telemetria (`rtdb_state_reporter_task`):**
+   - Állapotváltozáskor (`lamp_is_on`, `SensorP3` auto mód, `pending_energy_sec > 0`, `pending_p1_off`) azonnal, egyébként **20 másodpercenként** (`keep-alive` heartbeat) `PATCH /live/<deviceId>/state.json?auth=<id_token>` kérést küld:
+     `{"on":<bool>,"auto":<bool>,"lux":<u16>,"mot":<bool>,"ts":{".sv":"timestamp"},"energy_delta_sec":<u32>,"p1_off":<bool>}`.
+   - A `pending_energy_sec` (bekapcsolva töltött egész másodpercek) és a `pending_p1_off` jelző **kizárólag sikeres RTDB `HTTP 200` válasz után** nullázódik/csökken, így offline időszak alatti energiaadatok nem vesznek el.
 
 ---
 

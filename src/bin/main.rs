@@ -7,8 +7,12 @@ extern crate alloc;
 #[allow(dead_code)]
 mod secrets;
 
-use alloc::{boxed::Box, string::String, vec, vec::Vec};
-use core::{cell::RefCell, fmt::Write as _};
+use alloc::{string::String, vec::Vec};
+use core::{
+    cell::RefCell,
+    fmt::Write as _,
+    sync::atomic::{AtomicU32, Ordering},
+};
 use critical_section::Mutex;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, Either4, select, select4};
@@ -26,9 +30,13 @@ use embassy_net::{
     },
     udp::{PacketMetadata, UdpSocket},
 };
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex as EmbassyMutex};
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex,
+    mutex::Mutex as EmbassyMutex,
+    signal::Signal,
+};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
-use embedded_io_async::Write as _;
+use embedded_io_async::{Read as _, Write as _};
 use esp_backtrace as _;
 use esp_bootloader_esp_idf::partitions::{
     DataPartitionSubType, PARTITION_TABLE_MAX_LEN, PartitionType, read_partition_table,
@@ -62,9 +70,13 @@ use static_cell::StaticCell;
 esp_bootloader_esp_idf::esp_app_desc!();
 
 const NVS_FALLBACK_OFFSET: u32 = 0x9000;
-const NVS_MAGIC: [u8; 4] = *b"SLN2";
-const NVS_VERSION: u8 = 3;
-const NVS_RECORD_LEN: usize = 128;
+const NVS_LEGACY_MAGIC: [u8; 4] = *b"SLN2";
+const NVS_LEGACY_VERSION: u8 = 3;
+const NVS_LEGACY_RECORD_LEN: usize = 128;
+const NVS_MAGIC: [u8; 4] = *b"SLN3";
+const NVS_VERSION: u8 = 4;
+const NVS_RECORD_LEN: usize = 512;
+const MAX_REFRESH_TOKEN_LEN: usize = 320;
 
 const FACTORY_PASSKEY: &str = "K7M9P2X4R8";
 const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
@@ -75,6 +87,68 @@ const MAX_POST_BODY_BYTES: usize = 512;
 const KEEPALIVE_INTERVAL_SECS: u64 = 15;
 const CLOUD_FUNC_URL: &str = "https://verifypairing-lfmgd4eena-uc.a.run.app";
 const ESP_AUTH_TOKEN: &str = "ESP32_SECRET_TOKEN_998877";
+const FIREBASE_WEB_API_KEY: &str = "AIzaSyCymXk2RyRcQ3Rn5JSvJvJeQIMAxH0KyQU";
+const RTDB_HOST: &str = "okospilacsvezerlo-default-rtdb.europe-west1.firebasedatabase.app";
+const AUTH_CUSTOM_TOKEN_URL_BASE: &str =
+    "https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=";
+const AUTH_REFRESH_TOKEN_URL_BASE: &str = "https://securetoken.googleapis.com/v1/token?key=";
+const TOKEN_REFRESH_INTERVAL_SECS: u64 = 45 * 60;
+const RTDB_HEARTBEAT_INTERVAL_SECS: u64 = 20;
+const SSE_READ_TIMEOUT_SECS: u64 = 60;
+const MAX_ID_TOKEN_LEN: usize = 1536;
+
+static NVS_FLASH: EmbassyMutex<CriticalSectionRawMutex, Option<FlashStorage<'static>>> =
+    EmbassyMutex::new(None);
+
+/// Fixed-capacity stack/static UTF-8 string buffer avoiding heap allocations.
+struct FixedBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> FixedBuf<N> {
+    const fn new() -> Self {
+        Self {
+            buf: [0u8; N],
+            len: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> bool {
+        if self.len + bytes.len() > N {
+            return false;
+        }
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+        true
+    }
+}
+
+impl<const N: usize> core::fmt::Write for FixedBuf<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        if self.push_bytes(s.as_bytes()) {
+            Ok(())
+        } else {
+            Err(core::fmt::Error)
+        }
+    }
+}
 
 #[derive(Clone, Eq, PartialEq)]
 struct WifiCredentials {
@@ -99,10 +173,49 @@ impl DeviceConfig {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct NvsData {
     config: DeviceConfig,
     wifi: Option<WifiCredentials>,
+    refresh_token: [u8; MAX_REFRESH_TOKEN_LEN],
+    refresh_token_len: u16,
+}
+
+impl Default for NvsData {
+    fn default() -> Self {
+        Self {
+            config: DeviceConfig::default(),
+            wifi: None,
+            refresh_token: [0u8; MAX_REFRESH_TOKEN_LEN],
+            refresh_token_len: 0,
+        }
+    }
+}
+
+impl NvsData {
+    fn refresh_token_str(&self) -> Option<&str> {
+        let len = self.refresh_token_len as usize;
+        if len == 0 || len > MAX_REFRESH_TOKEN_LEN {
+            return None;
+        }
+        core::str::from_utf8(&self.refresh_token[..len]).ok()
+    }
+
+    fn set_refresh_token(&mut self, token: &str) -> bool {
+        let bytes = token.as_bytes();
+        if bytes.len() > MAX_REFRESH_TOKEN_LEN {
+            return false;
+        }
+        self.refresh_token.fill(0);
+        self.refresh_token[..bytes.len()].copy_from_slice(bytes);
+        self.refresh_token_len = bytes.len() as u16;
+        true
+    }
+
+    fn clear_refresh_token(&mut self) {
+        self.refresh_token.fill(0);
+        self.refresh_token_len = 0;
+    }
 }
 
 /// Background task driving the onboard WS2812 RGB LED exclusively to mirror `lamp_is_on`:
@@ -138,7 +251,7 @@ async fn led_task(rmt_periph: RMT<'static>, pin: GPIO48<'static>) -> ! {
     }
 }
 
-/// Computes a 32-bit FNV-1a checksum for NVS integrity verification.
+/// Computes a 32-bit FNV-1a checksum for legacy `SLN2` NVS migration verification.
 fn fnv1a_32(data: &[u8]) -> u32 {
     let mut hash: u32 = 0x811c_9dc5;
     for &b in data {
@@ -146,6 +259,19 @@ fn fnv1a_32(data: &[u8]) -> u32 {
         hash = hash.wrapping_mul(0x0100_0193);
     }
     hash
+}
+
+/// Computes standard IEEE CRC32 checksum for `SLN3` NVS integrity verification.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
 }
 
 /// Resolves the NVS partition offset from the ESP-IDF partition table, or falls back to 0x9000.
@@ -159,23 +285,8 @@ fn nvs_partition_offset(flash: &mut FlashStorage<'_>) -> u32 {
     NVS_FALLBACK_OFFSET
 }
 
-/// Reads and validates the 4 core config parameters and single Wi-Fi credential slot from NVS.
-fn load_nvs_data(flash: &mut FlashStorage<'_>) -> NvsData {
-    let offset = nvs_partition_offset(flash);
-    let mut buf = [0u8; NVS_RECORD_LEN];
-    if flash.read(offset, &mut buf).is_err() {
-        return NvsData::default();
-    }
-
-    if buf[0..4] != NVS_MAGIC || buf[4] != NVS_VERSION {
-        return NvsData::default();
-    }
-
-    let expected_crc = u32::from_le_bytes([buf[124], buf[125], buf[126], buf[127]]);
-    if fnv1a_32(&buf[0..124]) != expected_crc {
-        return NvsData::default();
-    }
-
+/// Parses config and Wi-Fi credentials from the shared header bytes (bytes 5..124).
+fn parse_nvs_config_and_wifi(buf: &[u8]) -> (DeviceConfig, Option<WifiCredentials>) {
     let config = DeviceConfig {
         threshold: u16::from_le_bytes([buf[8], buf[9]]),
         duration: u64::from_le_bytes([
@@ -206,11 +317,69 @@ fn load_nvs_data(flash: &mut FlashStorage<'_>) -> NvsData {
         None
     };
 
-    NvsData { config, wifi }
+    (config, wifi)
 }
 
-/// Serializes and writes the 4 core config parameters and single Wi-Fi credential slot to NVS.
+/// Reads and validates the `SLN3` (512-byte) NVS record, migrating legacy `SLN2` (128-byte) if present.
+fn load_nvs_data(flash: &mut FlashStorage<'_>) -> NvsData {
+    let offset = nvs_partition_offset(flash);
+    let mut buf = [0u8; NVS_RECORD_LEN];
+    if flash.read(offset, &mut buf).is_err() {
+        return NvsData::default();
+    }
+
+    if buf[0..4] == NVS_MAGIC && buf[4] == NVS_VERSION {
+        let expected_crc = u32::from_le_bytes([buf[508], buf[509], buf[510], buf[511]]);
+        if crc32(&buf[0..508]) != expected_crc {
+            return NvsData::default();
+        }
+        let (config, wifi) = parse_nvs_config_and_wifi(&buf);
+        let rt_len = u16::from_le_bytes([buf[21], buf[22]]);
+        let mut refresh_token = [0u8; MAX_REFRESH_TOKEN_LEN];
+        let valid_rt_len = if (rt_len as usize) <= MAX_REFRESH_TOKEN_LEN
+            && core::str::from_utf8(&buf[124..124 + rt_len as usize]).is_ok()
+        {
+            refresh_token[..rt_len as usize].copy_from_slice(&buf[124..124 + rt_len as usize]);
+            rt_len
+        } else {
+            0
+        };
+        return NvsData {
+            config,
+            wifi,
+            refresh_token,
+            refresh_token_len: valid_rt_len,
+        };
+    }
+
+    if buf[0..4] == NVS_LEGACY_MAGIC && buf[4] == NVS_LEGACY_VERSION {
+        let legacy_crc = u32::from_le_bytes([buf[124], buf[125], buf[126], buf[127]]);
+        if fnv1a_32(&buf[0..NVS_LEGACY_RECORD_LEN - 4]) != legacy_crc {
+            return NvsData::default();
+        }
+        let (config, wifi) = parse_nvs_config_and_wifi(&buf[..NVS_LEGACY_RECORD_LEN]);
+        let migrated = NvsData {
+            config,
+            wifi,
+            refresh_token: [0u8; MAX_REFRESH_TOKEN_LEN],
+            refresh_token_len: 0,
+        };
+        if save_nvs_data(flash, &migrated).is_ok() {
+            println!("NVS: Migrated legacy SLN2 (128B) -> SLN3 (512B) with CRC32.");
+        }
+        return migrated;
+    }
+
+    NvsData::default()
+}
+
+/// Serializes and writes the 512-byte `SLN3` NVS record protected by CRC32.
 fn save_nvs_data(flash: &mut FlashStorage<'_>, data: &NvsData) -> Result<(), ()> {
+    let rt_len = data.refresh_token_len as usize;
+    if rt_len > MAX_REFRESH_TOKEN_LEN {
+        return Err(());
+    }
+
     let mut buf = [0u8; NVS_RECORD_LEN];
     buf[0..4].copy_from_slice(&NVS_MAGIC);
     buf[4] = NVS_VERSION;
@@ -219,6 +388,7 @@ fn save_nvs_data(flash: &mut FlashStorage<'_>, data: &NvsData) -> Result<(), ()>
     buf[10..18].copy_from_slice(&data.config.duration.to_le_bytes());
     buf[18] = data.config.sensitivity;
     buf[19..21].copy_from_slice(&data.config.safety_off_min.to_le_bytes());
+    buf[21..23].copy_from_slice(&data.refresh_token_len.to_le_bytes());
 
     if let Some(creds) = &data.wifi {
         let ssid_bytes = creds.ssid.as_bytes();
@@ -233,11 +403,35 @@ fn save_nvs_data(flash: &mut FlashStorage<'_>, data: &NvsData) -> Result<(), ()>
         buf[60..60 + pass_bytes.len()].copy_from_slice(pass_bytes);
     }
 
-    let crc = fnv1a_32(&buf[0..124]);
-    buf[124..128].copy_from_slice(&crc.to_le_bytes());
+    if rt_len > 0 {
+        buf[124..124 + rt_len].copy_from_slice(&data.refresh_token[..rt_len]);
+    }
+
+    let crc = crc32(&buf[0..508]);
+    buf[508..512].copy_from_slice(&crc.to_le_bytes());
 
     let offset = nvs_partition_offset(flash);
     flash.write(offset, &buf).map_err(|_| ())
+}
+
+async fn nvs_load() -> NvsData {
+    let mut guard = NVS_FLASH.lock().await;
+    match guard.as_mut() {
+        Some(flash) => load_nvs_data(flash),
+        None => NvsData::default(),
+    }
+}
+
+async fn nvs_update<F: FnOnce(&mut NvsData) -> bool>(f: F) -> Result<bool, ()> {
+    let mut guard = NVS_FLASH.lock().await;
+    let flash = guard.as_mut().ok_or(())?;
+    let mut data = load_nvs_data(flash);
+    if f(&mut data) {
+        save_nvs_data(flash, &data)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 /// Minimal DHCPv4 server on UDP port 67 for SoftAP clients.
@@ -880,7 +1074,6 @@ async fn scan_nearby_ssids(controller: &mut WifiController<'_>) -> Vec<String> {
 async fn http_portal_server(
     stack: Stack<'_>,
     controller: &mut WifiController<'_>,
-    flash: &mut FlashStorage<'_>,
     device_name: &str,
     initial_ssids: Vec<String>,
     ap_deadline: &EmbassyMutex<CriticalSectionRawMutex, Option<Instant>>,
@@ -961,7 +1154,7 @@ async fn http_portal_server(
 
             match (method, path) {
                 ("GET", "/status") => {
-                    let nvs = load_nvs_data(flash);
+                    let nvs = nvs_load().await;
                     let saved_ssid = nvs.wifi.as_ref().map(|w| w.ssid.as_str()).unwrap_or("");
                     let remaining_secs = {
                         let dl_opt = *ap_deadline.lock().await;
@@ -1026,18 +1219,21 @@ async fn http_portal_server(
                     .await;
                 }
                 ("POST", "/clear-wifi") => {
-                    let mut nvs = load_nvs_data(flash);
-                    {
+                    let cur_cfg = {
                         let state = DEVICE_STATE.lock().await;
-                        nvs.config = DeviceConfig {
+                        DeviceConfig {
                             threshold: state.threshold,
                             sensitivity: state.sensitivity,
                             duration: state.duration,
                             safety_off_min: state.safety_off_min,
-                        };
-                    }
-                    nvs.wifi = None;
-                    let _ = save_nvs_data(flash, &nvs);
+                        }
+                    };
+                    let _ = nvs_update(|nvs| {
+                        nvs.config = cur_cfg;
+                        nvs.wifi = None;
+                        true
+                    })
+                    .await;
                     *last_wifi_error = false;
                     {
                         let mut dl = ap_deadline.lock().await;
@@ -1100,9 +1296,11 @@ async fn http_portal_server(
                             prev != new_cfg
                         };
                         if changed {
-                            let mut nvs = load_nvs_data(flash);
-                            nvs.config = new_cfg;
-                            let _ = save_nvs_data(flash, &nvs);
+                            let _ = nvs_update(|nvs| {
+                                nvs.config = new_cfg;
+                                true
+                            })
+                            .await;
                             println!(
                                 "PORTAL: Config updated and saved to NVS (threshold={}, sensitivity={}, duration={}s, safety_off_min={}m).",
                                 new_cfg.threshold, new_cfg.sensitivity, new_cfg.duration, new_cfg.safety_off_min
@@ -1210,7 +1408,7 @@ static NTP_TIME: Mutex<RefCell<Option<NtpSyncState>>> = Mutex::new(RefCell::new(
 
 const TLS_RX_BUF_LEN: usize = 16640;
 const TLS_TX_BUF_LEN: usize = 16640;
-const HTTP_RX_BUF_LEN: usize = 8192;
+const HTTP_RX_BUF_LEN: usize = 6144;
 const NTP_SERVER: &str = "pool.ntp.org";
 const NTP_PORT: u16 = 123;
 const NTP_TO_UNIX_EPOCH: u64 = 2_208_988_800;
@@ -1239,9 +1437,13 @@ struct DeviceState {
     lamp_is_on: bool,
     lamp_on_source: LampOnSource,
     p2_turned_on_at: Option<Instant>,
+    lamp_on_started: Option<Instant>,
     last_movement_ts: Option<Instant>,
     current_lux: u16,
     simulated_pir: bool,
+    pir_active: bool,
+    pending_energy_sec: u32,
+    pending_p1_off: bool,
 }
 
 impl DeviceState {
@@ -1265,10 +1467,93 @@ static DEVICE_STATE: EmbassyMutex<CriticalSectionRawMutex, DeviceState> =
         lamp_is_on: false,
         lamp_on_source: LampOnSource::None,
         p2_turned_on_at: None,
+        lamp_on_started: None,
         last_movement_ts: None,
         current_lux: 0,
         simulated_pir: false,
+        pir_active: false,
+        pending_energy_sec: 0,
+        pending_p1_off: false,
     });
+
+struct AuthState {
+    id_token: FixedBuf<MAX_ID_TOKEN_LEN>,
+    obtained_at: Option<Instant>,
+    force_refresh: bool,
+    consecutive_rtdb_auth_errors: u8,
+}
+
+impl AuthState {
+    const fn new() -> Self {
+        Self {
+            id_token: FixedBuf::new(),
+            obtained_at: None,
+            force_refresh: false,
+            consecutive_rtdb_auth_errors: 0,
+        }
+    }
+}
+
+static AUTH_STATE: EmbassyMutex<CriticalSectionRawMutex, AuthState> =
+    EmbassyMutex::new(AuthState::new());
+static AUTH_WAKE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static SSE_WAKE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static REPORTER_STATE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+static TLS_SEED_NONCE: AtomicU32 = AtomicU32::new(1);
+
+fn next_tls_seed(base: u64) -> u64 {
+    let n = TLS_SEED_NONCE.fetch_add(1, Ordering::Relaxed) as u64;
+    base ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+struct HttpsScratch {
+    tcp_state: TcpClientState<1, 2048, 2048>,
+    tls_rx: [u8; TLS_RX_BUF_LEN],
+    tls_tx: [u8; TLS_TX_BUF_LEN],
+    http_rx: [u8; HTTP_RX_BUF_LEN],
+}
+
+impl HttpsScratch {
+    const fn new() -> Self {
+        Self {
+            tcp_state: TcpClientState::new(),
+            tls_rx: [0u8; TLS_RX_BUF_LEN],
+            tls_tx: [0u8; TLS_TX_BUF_LEN],
+            http_rx: [0u8; HTTP_RX_BUF_LEN],
+        }
+    }
+}
+
+static HTTPS_SCRATCH: EmbassyMutex<CriticalSectionRawMutex, HttpsScratch> =
+    EmbassyMutex::new(HttpsScratch::new());
+
+struct SseScratch {
+    tcp_state: TcpClientState<1, 2048, 2048>,
+    tls_rx: [u8; TLS_RX_BUF_LEN],
+    tls_tx: [u8; TLS_TX_BUF_LEN],
+    http_rx: [u8; 1536],
+    line_buf: [u8; 1024],
+    data_buf: FixedBuf<1024>,
+    url_buf: FixedBuf<1792>,
+}
+
+impl SseScratch {
+    const fn new() -> Self {
+        Self {
+            tcp_state: TcpClientState::new(),
+            tls_rx: [0u8; TLS_RX_BUF_LEN],
+            tls_tx: [0u8; TLS_TX_BUF_LEN],
+            http_rx: [0u8; 1536],
+            line_buf: [0u8; 1024],
+            data_buf: FixedBuf::new(),
+            url_buf: FixedBuf::new(),
+        }
+    }
+}
+
+static SSE_SCRATCH: EmbassyMutex<CriticalSectionRawMutex, SseScratch> =
+    EmbassyMutex::new(SseScratch::new());
 
 #[derive(Copy, Clone)]
 struct NtpSyncState {
@@ -1299,74 +1584,150 @@ fn current_unix_timestamp() -> Option<u64> {
     })
 }
 
-/// Executes an async HTTPS request over `embassy_net` using `reqwless` + `embedded-tls`.
-async fn https_request(
+/// Executes an async HTTPS request using static TLS/TCP scratch buffers (zero large heap allocs)
+/// and passes `(status_code, response_body)` to `parse`.
+async fn https_request_with<R>(
     stack: Stack<'static>,
     seed: u64,
     method: Method,
     url: &str,
     extra_headers: &[(&str, &str)],
+    content_type: Option<ContentType>,
     body: Option<&[u8]>,
-) -> Result<(u16, Vec<u8>), &'static str> {
-    let tcp_state = Box::new(TcpClientState::<1, 4096, 4096>::new());
-    let tcp_client = TcpClient::new(stack, &tcp_state);
-    let dns_socket = DnsSocket::new(stack);
+    parse: impl FnOnce(u16, &[u8]) -> R,
+) -> Result<R, &'static str> {
+    let mut scratch = HTTPS_SCRATCH.lock().await;
+    let HttpsScratch {
+        tcp_state,
+        tls_rx,
+        tls_tx,
+        http_rx,
+    } = &mut *scratch;
 
-    let mut tls_rx = vec![0u8; TLS_RX_BUF_LEN];
-    let mut tls_tx = vec![0u8; TLS_TX_BUF_LEN];
-    let tls_config = TlsConfig::new(seed, &mut tls_rx, &mut tls_tx, TlsVerify::None);
-    let mut client = HttpClient::new_with_tls(&tcp_client, &dns_socket, tls_config);
+    let fut = async {
+        let tcp_client = TcpClient::new(stack, tcp_state);
+        let dns_socket = DnsSocket::new(stack);
+        let tls_config = TlsConfig::new(next_tls_seed(seed), tls_rx, tls_tx, TlsVerify::None);
+        let mut client = HttpClient::new_with_tls(&tcp_client, &dns_socket, tls_config);
 
-    let mut req = client
-        .request(method, url)
-        .await
-        .map_err(|_| "HTTP request init failed")?;
+        let mut req = client
+            .request(method, url)
+            .await
+            .map_err(|_| "HTTP request init failed")?;
 
-    if !extra_headers.is_empty() {
-        req = req.headers(extra_headers);
-    }
+        if !extra_headers.is_empty() {
+            req = req.headers(extra_headers);
+        }
+        if let Some(ct) = content_type {
+            req = req.content_type(ct);
+        }
 
-    let mut rx_buf = vec![0u8; HTTP_RX_BUF_LEN];
-    if let Some(payload) = body {
-        let mut req = req.content_type(ContentType::ApplicationJson).body(payload);
-        let resp = req
-            .send(&mut rx_buf)
-            .await
-            .map_err(|_| "HTTPS send failed")?;
-        let status = resp.status.0;
-        let resp_bytes = resp
-            .body()
-            .read_to_end()
-            .await
-            .map_err(|_| "HTTPS body read failed")?;
-        Ok((status, resp_bytes.to_vec()))
-    } else {
-        let resp = req
-            .send(&mut rx_buf)
-            .await
-            .map_err(|_| "HTTPS send failed")?;
-        let status = resp.status.0;
-        let resp_bytes = resp
-            .body()
-            .read_to_end()
-            .await
-            .map_err(|_| "HTTPS body read failed")?;
-        Ok((status, resp_bytes.to_vec()))
+        if let Some(payload) = body {
+            let mut req = req.body(payload);
+            let resp = req
+                .send(http_rx)
+                .await
+                .map_err(|_| "HTTPS send failed")?;
+            let status = resp.status.0;
+            let resp_bytes = resp
+                .body()
+                .read_to_end()
+                .await
+                .map_err(|_| "HTTPS body read failed")?;
+            Ok(parse(status, resp_bytes))
+        } else {
+            let resp = req
+                .send(http_rx)
+                .await
+                .map_err(|_| "HTTPS send failed")?;
+            let status = resp.status.0;
+            let resp_bytes = resp
+                .body()
+                .read_to_end()
+                .await
+                .map_err(|_| "HTTPS body read failed")?;
+            Ok(parse(status, resp_bytes))
+        }
+    };
+
+    match with_timeout(Duration::from_secs(20), fut).await {
+        Ok(res) => res,
+        Err(_) => Err("HTTPS request timed out"),
     }
 }
 
-/// Attempts cloud pairing against `CLOUD_FUNC_URL` for up to 5 minutes after Wi-Fi is connected.
-#[embassy_executor::task]
-async fn pairing_test_task(stack: Stack<'static>, seed: u64) {
-    stack.wait_config_up().await;
+async fn read_id_token_copy() -> FixedBuf<MAX_ID_TOKEN_LEN> {
+    let auth = AUTH_STATE.lock().await;
+    let mut out = FixedBuf::new();
+    let _ = out.push_bytes(auth.id_token.as_bytes());
+    out
+}
 
+async fn set_auth_id_token(token: &str) -> bool {
+    let mut auth = AUTH_STATE.lock().await;
+    auth.id_token.clear();
+    if !auth.id_token.push_bytes(token.as_bytes()) {
+        auth.obtained_at = None;
+        return false;
+    }
+    auth.obtained_at = Some(Instant::now());
+    auth.force_refresh = false;
+    true
+}
+
+async fn clear_auth_id_token() {
+    let mut auth = AUTH_STATE.lock().await;
+    auth.id_token.clear();
+    auth.obtained_at = None;
+}
+
+async fn mark_rtdb_ok() {
+    let mut auth = AUTH_STATE.lock().await;
+    auth.consecutive_rtdb_auth_errors = 0;
+}
+
+async fn mark_rtdb_auth_error() {
+    let mut auth = AUTH_STATE.lock().await;
+    auth.id_token.clear();
+    auth.obtained_at = None;
+    auth.force_refresh = true;
+    auth.consecutive_rtdb_auth_errors = auth.consecutive_rtdb_auth_errors.saturating_add(1);
+}
+
+#[derive(Deserialize)]
+struct VerifyPairingResp {
+    #[serde(rename = "customToken")]
+    custom_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CustomTokenExchangeResp {
+    #[serde(rename = "idToken")]
+    id_token: Option<String>,
+    #[serde(rename = "refreshToken")]
+    refresh_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RefreshTokenResp {
+    id_token: Option<String>,
+    refresh_token: Option<String>,
+}
+
+/// Polls `verifyPairing` for up to 5 minutes until HTTP 200 with a `customToken` is received.
+async fn poll_verify_pairing(
+    stack: Stack<'static>,
+    seed: u64,
+    device_id: &str,
+    esp_uid: &str,
+) -> Option<String> {
     let window_start = Instant::now();
     let window_duration = Duration::from_secs(PAIRING_WINDOW_SECS);
-    let device_id = build_device_name();
-    let esp_uid = build_esp_uid();
     let headers = [("X-Esp-Auth-Token", ESP_AUTH_TOKEN)];
-    let payload = alloc::format!(
-        r#"{{"deviceId": "{}", "pin": "{}", "espUid": "{}"}}"#,
+    let mut payload = FixedBuf::<256>::new();
+    let _ = write!(
+        payload,
+        r#"{{"deviceId":"{}","pin":"{}","espUid":"{}"}}"#,
         device_id, FACTORY_PASSKEY, esp_uid
     );
 
@@ -1376,28 +1737,44 @@ async fn pairing_test_task(stack: Stack<'static>, seed: u64) {
     );
 
     loop {
-        let elapsed = window_start.elapsed();
-        if elapsed >= window_duration {
+        if !stack.is_config_up() {
+            stack.wait_config_up().await;
+        }
+        if window_start.elapsed() >= window_duration {
             break;
         }
 
         println!("PAIRING: Sending verifyPairing POST to {}", CLOUD_FUNC_URL);
-        match https_request(
+        match https_request_with(
             stack,
             seed,
             Method::POST,
             CLOUD_FUNC_URL,
             &headers,
+            Some(ContentType::ApplicationJson),
             Some(payload.as_bytes()),
+            |status, body| {
+                let token = if status == 200 {
+                    serde_json::from_slice::<VerifyPairingResp>(body)
+                        .ok()
+                        .and_then(|r| r.custom_token)
+                } else {
+                    None
+                };
+                (status, token)
+            },
         )
         .await
         {
-            Ok((200, _)) => {
+            Ok((200, Some(ct))) if !ct.is_empty() => {
                 println!(
-                    "PAIRING: Pairing successful (HTTP 200) for {}; closing pairing window.",
+                    "PAIRING: Pairing successful (HTTP 200) for {}; received customToken.",
                     device_id
                 );
-                return;
+                return Some(ct);
+            }
+            Ok((200, _)) => {
+                println!("PAIRING: HTTP 200 without customToken; retrying...");
             }
             Ok((code @ (400 | 401 | 403 | 404), _)) => {
                 println!("PAIRING: verifyPairing returned status: {}", code);
@@ -1426,9 +1803,765 @@ async fn pairing_test_task(stack: Stack<'static>, seed: u64) {
     }
 
     println!(
-        "PAIRING: 5-minute pairing window closed for {} without HTTP 200 (re-open via Hard Reset or PWA/Portal Restart).",
+        "PAIRING: 5-minute pairing window closed for {} without pairing (re-open via Hard Reset or Portal/PWA Restart).",
         device_id
     );
+    None
+}
+
+/// Exchanges a Firebase `customToken` for an `idToken` (RAM) and `refreshToken` (SLN3 NVS).
+async fn exchange_custom_token(stack: Stack<'static>, seed: u64, custom_token: &str) -> bool {
+    let mut url = FixedBuf::<256>::new();
+    let _ = write!(url, "{}{}", AUTH_CUSTOM_TOKEN_URL_BASE, FIREBASE_WEB_API_KEY);
+    let body = alloc::format!(
+        r#"{{"token":"{}","returnSecureToken":true}}"#,
+        custom_token
+    );
+
+    match https_request_with(
+        stack,
+        seed,
+        Method::POST,
+        url.as_str(),
+        &[],
+        Some(ContentType::ApplicationJson),
+        Some(body.as_bytes()),
+        |status, resp_body| {
+            let parsed = if status == 200 {
+                serde_json::from_slice::<CustomTokenExchangeResp>(resp_body).ok()
+            } else {
+                None
+            };
+            (status, parsed)
+        },
+    )
+    .await
+    {
+        Ok((200, Some(resp))) => {
+            if let (Some(id_tok), Some(ref_tok)) = (resp.id_token, resp.refresh_token)
+                && !id_tok.is_empty()
+                && !ref_tok.is_empty()
+            {
+                let saved = nvs_update(|nvs| {
+                    let ok = nvs.set_refresh_token(&ref_tok);
+                    if !ok {
+                        println!(
+                            "AUTH: refreshToken length ({}) exceeds 320B NVS slot!",
+                            ref_tok.len()
+                        );
+                    }
+                    ok
+                })
+                .await
+                .unwrap_or(false);
+                if saved && set_auth_id_token(&id_tok).await {
+                    let mut auth = AUTH_STATE.lock().await;
+                    auth.consecutive_rtdb_auth_errors = 0;
+                    drop(auth);
+                    println!("AUTH: Exchanged customToken -> idToken in RAM + refreshToken saved to SLN3 NVS.");
+                    SSE_WAKE_SIGNAL.signal(());
+                    REPORTER_STATE_SIGNAL.signal(());
+                    return true;
+                }
+            }
+            println!("AUTH: signInWithCustomToken missing/oversized tokens.");
+            false
+        }
+        Ok((status, _)) => {
+            println!("AUTH: signInWithCustomToken failed with HTTP {}", status);
+            false
+        }
+        Err(e) => {
+            println!("AUTH: signInWithCustomToken error: {}", e);
+            false
+        }
+    }
+}
+
+enum RefreshOutcome {
+    Ok,
+    Revoked,
+    TransientError,
+}
+
+/// Exchanges the NVS `refresh_token` for a fresh `id_token` (and updates rotated `refresh_token`).
+async fn refresh_id_token_via_nvs(
+    stack: Stack<'static>,
+    seed: u64,
+    refresh_token: &str,
+) -> RefreshOutcome {
+    let mut url = FixedBuf::<256>::new();
+    let _ = write!(url, "{}{}", AUTH_REFRESH_TOKEN_URL_BASE, FIREBASE_WEB_API_KEY);
+    let mut body = FixedBuf::<400>::new();
+    if write!(body, "grant_type=refresh_token&refresh_token={}", refresh_token).is_err() {
+        return RefreshOutcome::Revoked;
+    }
+    let headers = [("Content-Type", "application/x-www-form-urlencoded")];
+
+    match https_request_with(
+        stack,
+        seed,
+        Method::POST,
+        url.as_str(),
+        &headers,
+        None,
+        Some(body.as_bytes()),
+        |status, resp_body| {
+            let parsed = if status == 200 {
+                serde_json::from_slice::<RefreshTokenResp>(resp_body).ok()
+            } else {
+                None
+            };
+            (status, parsed)
+        },
+    )
+    .await
+    {
+        Ok((200, Some(resp))) => {
+            if let Some(id_tok) = resp.id_token
+                && !id_tok.is_empty()
+            {
+                if let Some(new_rt) = resp.refresh_token
+                    && !new_rt.is_empty()
+                    && new_rt != refresh_token
+                {
+                    let _ = nvs_update(|nvs| nvs.set_refresh_token(&new_rt)).await;
+                }
+                if set_auth_id_token(&id_tok).await {
+                    println!("AUTH: Refreshed id_token in RAM (valid 45m refresh cycle).");
+                    SSE_WAKE_SIGNAL.signal(());
+                    REPORTER_STATE_SIGNAL.signal(());
+                    return RefreshOutcome::Ok;
+                }
+            }
+            RefreshOutcome::TransientError
+        }
+        Ok((code @ (400 | 401 | 403), _)) => {
+            println!(
+                "AUTH: Refresh token rejected/revoked (HTTP {}); clearing SLN3 refresh_token.",
+                code
+            );
+            RefreshOutcome::Revoked
+        }
+        Ok((status, _)) => {
+            println!("AUTH: securetoken returned HTTP {}", status);
+            RefreshOutcome::TransientError
+        }
+        Err(e) => {
+            println!("AUTH: securetoken request failed: {}", e);
+            RefreshOutcome::TransientError
+        }
+    }
+}
+
+/// Manages pairing (`verifyPairing`), Custom Token exchange, and 45-min `id_token` refresh lifecycle.
+#[embassy_executor::task]
+async fn auth_task(stack: Stack<'static>, seed: u64) -> ! {
+    stack.wait_config_up().await;
+
+    let device_id = build_device_name();
+    let esp_uid = build_esp_uid();
+    let mut backoff_secs: u64 = 5;
+
+    loop {
+        if !stack.is_config_up() {
+            clear_auth_id_token().await;
+            println!("AUTH: Network offline; waiting for Wi-Fi + DHCP recovery...");
+            stack.wait_config_up().await;
+            let mut auth = AUTH_STATE.lock().await;
+            auth.force_refresh = true;
+            println!("AUTH: Network restored; triggering immediate id_token refresh.");
+        }
+
+        let nvs = nvs_load().await;
+        if let Some(rt) = nvs.refresh_token_str() {
+            let (need_refresh, rtdb_errors) = {
+                let auth = AUTH_STATE.lock().await;
+                let expired = auth.id_token.is_empty()
+                    || auth.force_refresh
+                    || auth
+                        .obtained_at
+                        .is_none_or(|t| t.elapsed() >= Duration::from_secs(TOKEN_REFRESH_INTERVAL_SECS));
+                (expired, auth.consecutive_rtdb_auth_errors)
+            };
+
+            if rtdb_errors >= 2 {
+                println!("AUTH: Repeated RTDB 401/403 after fresh token; treating device as unpaired.");
+                clear_auth_id_token().await;
+                let _ = nvs_update(|d| {
+                    d.clear_refresh_token();
+                    true
+                })
+                .await;
+                {
+                    let mut auth = AUTH_STATE.lock().await;
+                    auth.consecutive_rtdb_auth_errors = 0;
+                    auth.force_refresh = false;
+                }
+                SSE_WAKE_SIGNAL.signal(());
+                continue;
+            }
+
+            if need_refresh {
+                match refresh_id_token_via_nvs(stack, seed, rt).await {
+                    RefreshOutcome::Ok => {
+                        backoff_secs = 5;
+                    }
+                    RefreshOutcome::Revoked => {
+                        clear_auth_id_token().await;
+                        let _ = nvs_update(|d| {
+                            d.clear_refresh_token();
+                            true
+                        })
+                        .await;
+                        {
+                            let mut auth = AUTH_STATE.lock().await;
+                            auth.consecutive_rtdb_auth_errors = 0;
+                            auth.force_refresh = false;
+                        }
+                        SSE_WAKE_SIGNAL.signal(());
+                        continue;
+                    }
+                    RefreshOutcome::TransientError => {
+                        let wait = Duration::from_secs(backoff_secs);
+                        backoff_secs = (backoff_secs * 2).min(30);
+                        let _ = select(Timer::after(wait), AUTH_WAKE_SIGNAL.wait()).await;
+                        continue;
+                    }
+                }
+            }
+
+            // Online & token valid: wake every 2s to check link drop or 45-min renewal, or wake early on signal.
+            let _ = select(Timer::after(Duration::from_secs(2)), AUTH_WAKE_SIGNAL.wait()).await;
+        } else {
+            clear_auth_id_token().await;
+            if let Some(custom_token) =
+                poll_verify_pairing(stack, seed, &device_id, &esp_uid).await
+            {
+                for attempt in 1..=3 {
+                    if exchange_custom_token(stack, seed, &custom_token).await {
+                        break;
+                    }
+                    println!("AUTH: Custom token exchange attempt {}/3 failed; retrying...", attempt);
+                    Timer::after(Duration::from_secs(3)).await;
+                }
+            } else {
+                // 5-minute pairing window closed without pairing; sleep until woken (or reboot).
+                AUTH_WAKE_SIGNAL.wait().await;
+            }
+        }
+    }
+}
+
+struct CmdUpdate {
+    lamp: Option<bool>,
+    restart: Option<bool>,
+    thr: Option<u16>,
+    sens: Option<u8>,
+    dur: Option<u64>,
+    safe: Option<u16>,
+}
+
+fn parse_cmd_update_from_sse(json_str: &str) -> Option<CmdUpdate> {
+    let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let path = val.get("path")?.as_str()?;
+    let data = val.get("data")?;
+    if data.is_null() {
+        return None;
+    }
+
+    let mut upd = CmdUpdate {
+        lamp: None,
+        restart: None,
+        thr: None,
+        sens: None,
+        dur: None,
+        safe: None,
+    };
+
+    let parse_thr = |v: &serde_json::Value| {
+        v.as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .filter(|n| (1..=100).contains(n))
+    };
+    let parse_sens = |v: &serde_json::Value| {
+        v.as_u64()
+            .and_then(|n| u8::try_from(n).ok())
+            .filter(|n| (1..=100).contains(n))
+    };
+    let parse_dur = |v: &serde_json::Value| v.as_u64().filter(|n| (10..=600).contains(n));
+    let parse_safe = |v: &serde_json::Value| {
+        v.as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .filter(|n| *n <= 1440)
+    };
+
+    match path {
+        "/" => {
+            let obj = data.as_object()?;
+            upd.lamp = obj.get("lamp").and_then(|v| v.as_bool());
+            upd.restart = obj.get("restart").and_then(|v| v.as_bool());
+            upd.thr = obj.get("thr").and_then(parse_thr);
+            upd.sens = obj.get("sens").and_then(parse_sens);
+            upd.dur = obj.get("dur").and_then(parse_dur);
+            upd.safe = obj.get("safe").and_then(parse_safe);
+        }
+        "/lamp" => upd.lamp = data.as_bool(),
+        "/restart" => upd.restart = data.as_bool(),
+        "/thr" => upd.thr = parse_thr(data),
+        "/sens" => upd.sens = parse_sens(data),
+        "/dur" => upd.dur = parse_dur(data),
+        "/safe" => upd.safe = parse_safe(data),
+        _ => return None,
+    }
+
+    Some(upd)
+}
+
+async fn apply_cmd_update(
+    stack: Stack<'static>,
+    seed: u64,
+    device_id: &str,
+    id_token: &str,
+    upd: CmdUpdate,
+) {
+    let new_cfg = {
+        let mut state = DEVICE_STATE.lock().await;
+        if let Some(lamp_on) = upd.lamp {
+            if state.remote_lamp_on != lamp_on {
+                state.remote_lamp_on = lamp_on;
+                println!("SSE: Applied remote lamp command -> {}", lamp_on);
+            }
+        }
+        if let Some(v) = upd.thr {
+            state.threshold = v;
+        }
+        if let Some(v) = upd.sens {
+            state.sensitivity = v;
+        }
+        if let Some(v) = upd.dur {
+            state.duration = v;
+        }
+        if let Some(v) = upd.safe {
+            state.safety_off_min = v;
+        }
+        DeviceConfig {
+            threshold: state.threshold,
+            sensitivity: state.sensitivity,
+            duration: state.duration,
+            safety_off_min: state.safety_off_min,
+        }
+    };
+
+    if upd.thr.is_some() || upd.sens.is_some() || upd.dur.is_some() || upd.safe.is_some() {
+        let saved = nvs_update(|nvs| {
+            let mut candidate = nvs.config;
+            if let Some(v) = upd.thr {
+                candidate.threshold = v;
+            }
+            if let Some(v) = upd.sens {
+                candidate.sensitivity = v;
+            }
+            if let Some(v) = upd.dur {
+                candidate.duration = v;
+            }
+            if let Some(v) = upd.safe {
+                candidate.safety_off_min = v;
+            }
+            if candidate != nvs.config && candidate.is_configured() {
+                nvs.config = candidate;
+                true
+            } else {
+                false
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        if saved {
+            println!(
+                "SSE: Config changed -> saved to SLN3 NVS (thr={}, sens={}, dur={}s, safe={}m).",
+                new_cfg.threshold, new_cfg.sensitivity, new_cfg.duration, new_cfg.safety_off_min
+            );
+        }
+    }
+
+    if upd.restart == Some(true) {
+        println!("SSE: Remote restart requested! Clearing restart flag and rebooting...");
+        let mut patch_url = FixedBuf::<1792>::new();
+        let _ = write!(
+            patch_url,
+            "https://{}/live/{}/cmd.json?auth={}",
+            RTDB_HOST, device_id, id_token
+        );
+        let _ = https_request_with(
+            stack,
+            seed,
+            Method::PATCH,
+            patch_url.as_str(),
+            &[],
+            Some(ContentType::ApplicationJson),
+            Some(br#"{"restart":false}"#),
+            |status, _| status,
+        )
+        .await;
+        Timer::after(Duration::from_millis(500)).await;
+        esp_hal::system::software_reset();
+    }
+}
+
+/// Listens to `/live/<deviceId>/cmd.json` via Firebase RTDB Server-Sent Events (SSE).
+#[embassy_executor::task]
+async fn rtdb_sse_listener_task(stack: Stack<'static>, seed: u64) -> ! {
+    let device_id = build_device_name();
+    let backoff_steps = [2u64, 5, 10, 20, 30];
+    let mut backoff_idx: usize = 0;
+
+    loop {
+        if !stack.is_config_up() {
+            stack.wait_config_up().await;
+        }
+
+        SSE_WAKE_SIGNAL.reset();
+        let id_token = read_id_token_copy().await;
+        if id_token.is_empty() {
+            let _ = select(
+                Timer::after(Duration::from_secs(5)),
+                SSE_WAKE_SIGNAL.wait(),
+            )
+            .await;
+            continue;
+        }
+
+        enum SseStopReason {
+            AuthError,
+            TokenRotated,
+            Reconnect,
+            ApplyRestart,
+        }
+
+        let mut pending_restart_upd: Option<CmdUpdate> = None;
+
+        let stop_reason = {
+            let mut scratch = SSE_SCRATCH.lock().await;
+            let SseScratch {
+                tcp_state,
+                tls_rx,
+                tls_tx,
+                http_rx,
+                line_buf,
+                data_buf,
+                url_buf,
+            } = &mut *scratch;
+
+            url_buf.clear();
+            let _ = write!(
+                url_buf,
+                "https://{}/live/{}/cmd.json?auth={}",
+                RTDB_HOST,
+                device_id,
+                id_token.as_str()
+            );
+
+            let tcp_client = TcpClient::new(stack, tcp_state);
+            let dns_socket = DnsSocket::new(stack);
+            let tls_config = TlsConfig::new(next_tls_seed(seed), tls_rx, tls_tx, TlsVerify::None);
+            let mut client = HttpClient::new_with_tls(&tcp_client, &dns_socket, tls_config);
+
+            let sse_headers = [("Accept", "text/event-stream"), ("Connection", "keep-alive")];
+            let req_res = with_timeout(
+                Duration::from_secs(20),
+                client.request(Method::GET, url_buf.as_str()),
+            )
+            .await;
+
+            match req_res {
+                Ok(Ok(req_handle)) => {
+                    let mut req = req_handle.headers(&sse_headers);
+                    let send_res = with_timeout(Duration::from_secs(20), req.send(http_rx)).await;
+                    match send_res {
+                        Ok(Ok(resp)) => {
+                            let status = resp.status.0;
+                            if status == 401 || status == 403 {
+                                println!("SSE: RTDB rejected connection with HTTP {}", status);
+                                SseStopReason::AuthError
+                            } else if status != 200 {
+                                println!("SSE: Unexpected HTTP status {}", status);
+                                SseStopReason::Reconnect
+                            } else {
+                                println!("SSE: Connected to /live/{}/cmd.json", device_id);
+                                backoff_idx = 0;
+                                mark_rtdb_ok().await;
+
+                                let mut reader = resp.body().reader();
+                                let mut line_len: usize = 0;
+                                let mut line_overflow = false;
+                                let mut current_event = FixedBuf::<32>::new();
+                                data_buf.clear();
+                                let mut chunk = [0u8; 512];
+
+                                loop {
+                                    let read_sel = select(
+                                        with_timeout(
+                                            Duration::from_secs(SSE_READ_TIMEOUT_SECS),
+                                            reader.read(&mut chunk),
+                                        ),
+                                        SSE_WAKE_SIGNAL.wait(),
+                                    )
+                                    .await;
+
+                                    let n = match read_sel {
+                                        Either::Second(()) => {
+                                            println!("SSE: Woken for token update; reconnecting cleanly.");
+                                            break SseStopReason::TokenRotated;
+                                        }
+                                        Either::First(Err(_)) => {
+                                            println!("SSE: Stream read timed out; reconnecting...");
+                                            break SseStopReason::Reconnect;
+                                        }
+                                        Either::First(Ok(Err(_))) => {
+                                            println!("SSE: Stream read error; reconnecting...");
+                                            break SseStopReason::Reconnect;
+                                        }
+                                        Either::First(Ok(Ok(0))) => {
+                                            println!("SSE: Stream closed by server; reconnecting...");
+                                            break SseStopReason::Reconnect;
+                                        }
+                                        Either::First(Ok(Ok(n))) => n,
+                                    };
+
+                                    let mut frame_action: Option<SseStopReason> = None;
+
+                                    for &b in &chunk[..n] {
+                                        if b == b'\r' {
+                                            continue;
+                                        }
+                                        if b == b'\n' {
+                                            if line_overflow {
+                                                line_len = 0;
+                                                line_overflow = false;
+                                                current_event.clear();
+                                                data_buf.clear();
+                                                continue;
+                                            }
+
+                                            let line =
+                                                core::str::from_utf8(&line_buf[..line_len]).unwrap_or("");
+                                            line_len = 0;
+
+                                            if line.is_empty() {
+                                                let ev = current_event.as_str();
+                                                if ev == "auth_revoked" || ev == "cancel" {
+                                                    println!("SSE: Received '{}' event.", ev);
+                                                    frame_action = Some(SseStopReason::AuthError);
+                                                    break;
+                                                } else if (ev == "put" || ev == "patch")
+                                                    && !data_buf.is_empty()
+                                                {
+                                                    if let Some(upd) =
+                                                        parse_cmd_update_from_sse(data_buf.as_str())
+                                                    {
+                                                        if upd.restart == Some(true) {
+                                                            pending_restart_upd = Some(upd);
+                                                            frame_action =
+                                                                Some(SseStopReason::ApplyRestart);
+                                                            break;
+                                                        } else {
+                                                            apply_cmd_update(
+                                                                stack,
+                                                                seed,
+                                                                &device_id,
+                                                                id_token.as_str(),
+                                                                upd,
+                                                            )
+                                                            .await;
+                                                        }
+                                                    }
+                                                }
+                                                current_event.clear();
+                                                data_buf.clear();
+                                            } else if let Some(ev) = line.strip_prefix("event:") {
+                                                current_event.clear();
+                                                let _ = write!(current_event, "{}", ev.trim());
+                                            } else if let Some(d) = line.strip_prefix("data:") {
+                                                let payload = d.strip_prefix(' ').unwrap_or(d);
+                                                if !data_buf.is_empty() {
+                                                    let _ = data_buf.push_bytes(b"\n");
+                                                }
+                                                let _ = data_buf.push_bytes(payload.as_bytes());
+                                            }
+                                        } else if !line_overflow {
+                                            if line_len < line_buf.len() {
+                                                line_buf[line_len] = b;
+                                                line_len += 1;
+                                            } else {
+                                                line_overflow = true;
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(action) = frame_action {
+                                        break action;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Err(_)) => {
+                            println!("SSE: HTTP send failed; reconnecting...");
+                            SseStopReason::Reconnect
+                        }
+                        Err(_) => {
+                            println!("SSE: HTTP send timed out; reconnecting...");
+                            SseStopReason::Reconnect
+                        }
+                    }
+                }
+                Ok(Err(_)) => {
+                    println!("SSE: TCP/TLS connect failed; reconnecting...");
+                    SseStopReason::Reconnect
+                }
+                Err(_) => {
+                    println!("SSE: Connect/handshake timed out; reconnecting...");
+                    SseStopReason::Reconnect
+                }
+            }
+        };
+
+        // SSE_SCRATCH & TLS socket are cleanly dropped/closed here before any restart PATCH or backoff.
+        match stop_reason {
+            SseStopReason::ApplyRestart => {
+                if let Some(upd) = pending_restart_upd.take() {
+                    apply_cmd_update(stack, seed, &device_id, id_token.as_str(), upd).await;
+                }
+            }
+            SseStopReason::TokenRotated => {
+                continue;
+            }
+            SseStopReason::AuthError => {
+                mark_rtdb_auth_error().await;
+                AUTH_WAKE_SIGNAL.signal(());
+                let _ = select(
+                    Timer::after(Duration::from_secs(5)),
+                    SSE_WAKE_SIGNAL.wait(),
+                )
+                .await;
+            }
+            SseStopReason::Reconnect => {
+                let delay = backoff_steps[backoff_idx];
+                if backoff_idx + 1 < backoff_steps.len() {
+                    backoff_idx += 1;
+                }
+                let _ = select(
+                    Timer::after(Duration::from_secs(delay)),
+                    SSE_WAKE_SIGNAL.wait(),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+/// Reports device state & energy delta (`PATCH /live/<deviceId>/state.json`) on state changes or 20s heartbeat.
+#[embassy_executor::task]
+async fn rtdb_state_reporter_task(stack: Stack<'static>, seed: u64) -> ! {
+    let device_id = build_device_name();
+
+    loop {
+        if !stack.is_config_up() {
+            stack.wait_config_up().await;
+        }
+
+        let id_token = read_id_token_copy().await;
+        if id_token.is_empty() {
+            let _ = select(
+                Timer::after(Duration::from_secs(5)),
+                REPORTER_STATE_SIGNAL.wait(),
+            )
+            .await;
+            continue;
+        }
+
+        let (lamp_on, auto_on, lux, mot, energy_delta, p1_off) = {
+            let state = DEVICE_STATE.lock().await;
+            (
+                state.lamp_is_on,
+                state.lamp_on_source == LampOnSource::SensorP3,
+                state.current_lux,
+                state.pir_active,
+                state.pending_energy_sec.min(86400),
+                state.pending_p1_off,
+            )
+        };
+
+        let mut url = FixedBuf::<1792>::new();
+        let _ = write!(
+            url,
+            "https://{}/live/{}/state.json?auth={}",
+            RTDB_HOST,
+            device_id,
+            id_token.as_str()
+        );
+        let mut payload = FixedBuf::<256>::new();
+        let _ = write!(
+            payload,
+            r#"{{"on":{},"auto":{},"lux":{},"mot":{},"ts":{{".sv":"timestamp"}},"energy_delta_sec":{},"p1_off":{}}}"#,
+            lamp_on, auto_on, lux, mot, energy_delta, p1_off
+        );
+
+        match https_request_with(
+            stack,
+            seed,
+            Method::PATCH,
+            url.as_str(),
+            &[],
+            Some(ContentType::ApplicationJson),
+            Some(payload.as_bytes()),
+            |status, _| status,
+        )
+        .await
+        {
+            Ok(200) => {
+                mark_rtdb_ok().await;
+                let mut remaining_energy = false;
+                {
+                    let mut state = DEVICE_STATE.lock().await;
+                    state.pending_energy_sec =
+                        state.pending_energy_sec.saturating_sub(energy_delta);
+                    if p1_off {
+                        state.pending_p1_off = false;
+                    }
+                    if state.pending_energy_sec > 0 {
+                        remaining_energy = true;
+                    }
+                }
+                if remaining_energy {
+                    REPORTER_STATE_SIGNAL.signal(());
+                }
+            }
+            Ok(code @ (401 | 403)) => {
+                println!(
+                    "RTDB STATE: Rejected with HTTP {}; triggering token refresh/check.",
+                    code
+                );
+                mark_rtdb_auth_error().await;
+                AUTH_WAKE_SIGNAL.signal(());
+                Timer::after(Duration::from_secs(2)).await;
+                continue;
+            }
+            Ok(status) => {
+                println!("RTDB STATE: PATCH returned HTTP {}", status);
+            }
+            Err(e) => {
+                println!("RTDB STATE: PATCH failed ({}); keeping pending energy/p1_off.", e);
+            }
+        }
+
+        let _ = select(
+            Timer::after(Duration::from_secs(RTDB_HEARTBEAT_INTERVAL_SECS)),
+            REPORTER_STATE_SIGNAL.wait(),
+        )
+        .await;
+    }
 }
 
 /// Reads ambient light (in lux) from the BH1750 sensor over async I2C and updates `DEVICE_STATE`.
@@ -1656,9 +2789,128 @@ fn set_relay_output(
     pir_relay_opt: &mut Option<(Input<'static>, Output<'static>)>,
     state: &mut DeviceState,
     on: bool,
+    now: Instant,
 ) {
     let _ = pir_relay_opt;
+    let prev_on = state.lamp_is_on;
     state.lamp_is_on = on;
+    if !prev_on && on {
+        state.lamp_on_started = Some(now);
+    } else if prev_on && !on
+        && let Some(started) = state.lamp_on_started.take()
+    {
+        let elapsed_secs = now.duration_since(started).as_secs();
+        if elapsed_secs >= 1 {
+            state.pending_energy_sec = state
+                .pending_energy_sec
+                .saturating_add(elapsed_secs.min(u32::MAX as u64) as u32);
+        }
+    }
+}
+
+fn step_relay_state_machine(
+    pir_relay_opt: &mut Option<(Input<'static>, Output<'static>)>,
+    state: &mut DeviceState,
+    prev_pir_active: &mut bool,
+    now: Instant,
+) {
+    let pir_active = if let Some((pir, _)) = pir_relay_opt.as_ref() {
+        pir.is_high()
+    } else {
+        state.simulated_pir
+    };
+    state.pir_active = pir_active;
+
+    // [P1: Safety Timeout] ONLY applies when the lamp is ON due to P2 (remote_lamp_on == true)
+    // and safety_off_min > 0 (safety_off_min == 0 disables P1 shutoff).
+    // Evaluated independently of is_configured() so manual switching always works.
+    if state.remote_lamp_on
+        && state.lamp_on_source == LampOnSource::ManualP2
+        && state.safety_off_min > 0
+        && let Some(p2_ts) = state.p2_turned_on_at
+        && now.duration_since(p2_ts) >= Duration::from_secs((state.safety_off_min as u64) * 60)
+    {
+        set_relay_output(pir_relay_opt, state, false, now);
+        state.remote_lamp_on = false;
+        state.p2_turned_on_at = None;
+        state.lamp_on_source = LampOnSource::None;
+        state.last_movement_ts = None;
+        state.pending_p1_off = true;
+        println!(
+            "[P1 SAFETY OFF] Manual lamp ON exceeded {} min -> Forced OFF",
+            state.safety_off_min
+        );
+        *prev_pir_active = pir_active;
+        return;
+    }
+
+    // [P2: PWA / Captive Portal Manual Switch]
+    // Evaluated independently of is_configured() so clicking "Lámpa BE/KI" always works.
+    if state.remote_lamp_on {
+        if !state.lamp_is_on || state.lamp_on_source != LampOnSource::ManualP2 {
+            set_relay_output(pir_relay_opt, state, true, now);
+            state.lamp_on_source = LampOnSource::ManualP2;
+            state.p2_turned_on_at = Some(now);
+            println!("[P2 MANUAL ON] Lamp turned ON via PWA/Portal switch");
+        }
+        *prev_pir_active = pir_active;
+        return;
+    } else if state.lamp_on_source == LampOnSource::ManualP2 {
+        set_relay_output(pir_relay_opt, state, false, now);
+        state.p2_turned_on_at = None;
+        state.lamp_on_source = LampOnSource::None;
+        state.last_movement_ts = None;
+        println!("[P2 MANUAL OFF] Lamp turned OFF via PWA/Portal switch");
+        *prev_pir_active = pir_active;
+        return;
+    }
+
+    // Gate check ONLY for P3 (PIR + BH1750 Lux sensor automation).
+    if !state.is_configured() {
+        if state.lamp_is_on && state.lamp_on_source == LampOnSource::SensorP3 {
+            set_relay_output(pir_relay_opt, state, false, now);
+            state.lamp_on_source = LampOnSource::None;
+        }
+        state.last_movement_ts = None;
+        *prev_pir_active = pir_active;
+        return;
+    }
+
+    // [P3: PIR + BH1750 Lux Automation] (only evaluated when configured && remote_lamp_on == false)
+    if pir_active {
+        if !state.lamp_is_on {
+            let lux_limit = state.threshold.saturating_mul(10);
+            if state.current_lux < lux_limit {
+                set_relay_output(pir_relay_opt, state, true, now);
+                state.lamp_on_source = LampOnSource::SensorP3;
+                state.last_movement_ts = Some(now);
+                println!(
+                    "[P3 SENSOR ON] PIR active & lux ({}) < limit ({}) -> Lamp ON",
+                    state.current_lux, lux_limit
+                );
+            }
+        } else if state.lamp_on_source == LampOnSource::SensorP3 {
+            state.last_movement_ts = Some(now);
+            if !*prev_pir_active {
+                println!("[P3 MOTION] PIR active while Lamp ON -> duration timer refreshed");
+            }
+        }
+    } else if state.lamp_is_on
+        && state.lamp_on_source == LampOnSource::SensorP3
+        && state
+            .last_movement_ts
+            .is_none_or(|ts| now.duration_since(ts) >= Duration::from_secs(state.duration))
+    {
+        set_relay_output(pir_relay_opt, state, false, now);
+        state.last_movement_ts = None;
+        state.lamp_on_source = LampOnSource::None;
+        println!(
+            "[P3 DURATION OFF] No PIR motion for {}s -> Lamp OFF",
+            state.duration
+        );
+    }
+
+    *prev_pir_active = pir_active;
 }
 
 /// Non-blocking 100 ms offline-resilient state machine enforcing P1/P2/P3 relay priorities.
@@ -1672,103 +2924,29 @@ async fn relay_state_machine_task(
         Timer::after(Duration::from_millis(RELAY_TICK_MS)).await;
 
         let now = Instant::now();
-        let mut state = DEVICE_STATE.lock().await;
+        let should_notify = {
+            let mut state = DEVICE_STATE.lock().await;
+            let prev_on = state.lamp_is_on;
+            let prev_auto = state.lamp_on_source == LampOnSource::SensorP3;
+            let prev_energy = state.pending_energy_sec;
+            let prev_p1_off = state.pending_p1_off;
 
-        let pir_active = if let Some((pir, _)) = pir_relay_opt.as_ref() {
-            pir.is_high()
-        } else {
-            state.simulated_pir
+            step_relay_state_machine(&mut pir_relay_opt, &mut state, &mut prev_pir_active, now);
+
+            let cur_on = state.lamp_is_on;
+            let cur_auto = state.lamp_on_source == LampOnSource::SensorP3;
+            let cur_energy = state.pending_energy_sec;
+            let cur_p1_off = state.pending_p1_off;
+
+            cur_on != prev_on
+                || cur_auto != prev_auto
+                || (cur_energy > 0 && cur_energy != prev_energy)
+                || (cur_p1_off && !prev_p1_off)
         };
 
-        // [P1: Safety Timeout] ONLY applies when the lamp is ON due to P2 (remote_lamp_on == true)
-        // and safety_off_min > 0 (safety_off_min == 0 disables P1 shutoff).
-        // Evaluated independently of is_configured() so manual switching always works.
-        if state.remote_lamp_on
-            && state.lamp_on_source == LampOnSource::ManualP2
-            && state.safety_off_min > 0
-            && let Some(p2_ts) = state.p2_turned_on_at
-            && now.duration_since(p2_ts) >= Duration::from_secs((state.safety_off_min as u64) * 60)
-        {
-            set_relay_output(&mut pir_relay_opt, &mut state, false);
-            state.remote_lamp_on = false;
-            state.p2_turned_on_at = None;
-            state.lamp_on_source = LampOnSource::None;
-            state.last_movement_ts = None;
-            println!(
-                "[P1 SAFETY OFF] Manual lamp ON exceeded {} min -> Forced OFF",
-                state.safety_off_min
-            );
-            prev_pir_active = pir_active;
-            continue;
+        if should_notify {
+            REPORTER_STATE_SIGNAL.signal(());
         }
-
-        // [P2: PWA / Captive Portal Manual Switch]
-        // Evaluated independently of is_configured() so clicking "Lámpa BE/KI" always works.
-        if state.remote_lamp_on {
-            if !state.lamp_is_on || state.lamp_on_source != LampOnSource::ManualP2 {
-                set_relay_output(&mut pir_relay_opt, &mut state, true);
-                state.lamp_on_source = LampOnSource::ManualP2;
-                state.p2_turned_on_at = Some(now);
-                println!("[P2 MANUAL ON] Lamp turned ON via PWA/Portal switch");
-            }
-            prev_pir_active = pir_active;
-            continue;
-        } else if state.lamp_on_source == LampOnSource::ManualP2 {
-            set_relay_output(&mut pir_relay_opt, &mut state, false);
-            state.p2_turned_on_at = None;
-            state.lamp_on_source = LampOnSource::None;
-            state.last_movement_ts = None;
-            println!("[P2 MANUAL OFF] Lamp turned OFF via PWA/Portal switch");
-            prev_pir_active = pir_active;
-            continue;
-        }
-
-        // Gate check ONLY for P3 (PIR + BH1750 Lux sensor automation).
-        if !state.is_configured() {
-            if state.lamp_is_on && state.lamp_on_source == LampOnSource::SensorP3 {
-                set_relay_output(&mut pir_relay_opt, &mut state, false);
-                state.lamp_on_source = LampOnSource::None;
-            }
-            state.last_movement_ts = None;
-            prev_pir_active = pir_active;
-            continue;
-        }
-
-        // [P3: PIR + BH1750 Lux Automation] (only evaluated when configured && remote_lamp_on == false)
-        if pir_active {
-            if !state.lamp_is_on {
-                let lux_limit = state.threshold.saturating_mul(10);
-                if state.current_lux < lux_limit {
-                    set_relay_output(&mut pir_relay_opt, &mut state, true);
-                    state.lamp_on_source = LampOnSource::SensorP3;
-                    state.last_movement_ts = Some(now);
-                    println!(
-                        "[P3 SENSOR ON] PIR active & lux ({}) < limit ({}) -> Lamp ON",
-                        state.current_lux, lux_limit
-                    );
-                }
-            } else if state.lamp_on_source == LampOnSource::SensorP3 {
-                state.last_movement_ts = Some(now);
-                if !prev_pir_active {
-                    println!("[P3 MOTION] PIR active while Lamp ON -> duration timer refreshed");
-                }
-            }
-        } else if state.lamp_is_on
-            && state.lamp_on_source == LampOnSource::SensorP3
-            && state
-                .last_movement_ts
-                .is_none_or(|ts| now.duration_since(ts) >= Duration::from_secs(state.duration))
-        {
-            set_relay_output(&mut pir_relay_opt, &mut state, false);
-            state.last_movement_ts = None;
-            state.lamp_on_source = LampOnSource::None;
-            println!(
-                "[P3 DURATION OFF] No PIR motion for {}s -> Lamp OFF",
-                state.duration
-            );
-        }
-
-        prev_pir_active = pir_active;
     }
 }
 
@@ -1903,10 +3081,8 @@ async fn connect_sta_with_timeout(
     true
 }
 
-/// Runs periodic gateway ICMP keep-alive pings in Normal Online Mode.
-async fn sta_online_keepalive(stack: Stack<'static>) -> ! {
-    let gateway = stack.config_v4().and_then(|cfg| cfg.gateway);
-
+/// Runs periodic gateway ICMP keep-alive pings and auto-reconnects STA if Wi-Fi link drops.
+async fn sta_online_keepalive(stack: Stack<'static>, controller: &mut WifiController<'_>) -> ! {
     let mut icmp_rx_meta = [IcmpPacketMetadata::EMPTY; 1];
     let mut icmp_tx_meta = [IcmpPacketMetadata::EMPTY; 1];
     let mut icmp_rx_buf = [0u8; 128];
@@ -1914,6 +3090,14 @@ async fn sta_online_keepalive(stack: Stack<'static>) -> ! {
 
     loop {
         Timer::after(Duration::from_secs(KEEPALIVE_INTERVAL_SECS)).await;
+
+        if !stack.is_link_up() {
+            println!("Wi-Fi link down; attempting STA reconnect...");
+            let _ = with_timeout(Duration::from_secs(8), controller.connect_async()).await;
+            continue;
+        }
+
+        let gateway = stack.config_v4().and_then(|cfg| cfg.gateway);
         if let Some(gw) = gateway {
             let mut ping_mgr = PingManager::new(
                 stack,
@@ -1954,7 +3138,6 @@ async fn wait_ap_deadline(
 /// Runs WPA2-protected SoftAP + STA scan coex with Scan-Before-Countdown boot check.
 async fn run_captive_portal(
     controller: &mut WifiController<'_>,
-    flash: &mut FlashStorage<'_>,
     device_name: &str,
     seed: u64,
     allow_auto_countdown: bool,
@@ -1979,7 +3162,7 @@ async fn run_captive_portal(
         scanned_ssids.len()
     );
 
-    let latest_nvs = load_nvs_data(flash);
+    let latest_nvs = nvs_load().await;
     let saved_ssid_visible = latest_nvs
         .wifi
         .as_ref()
@@ -2037,7 +3220,6 @@ async fn run_captive_portal(
         http_portal_server(
             stack,
             controller,
-            flash,
             device_name,
             scanned_ssids,
             &ap_deadline,
@@ -2053,15 +3235,19 @@ async fn run_captive_portal(
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
-    esp_alloc::heap_allocator!(size: 128 * 1024);
+    esp_alloc::heap_allocator!(size: 80 * 1024);
 
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
-    let mut flash = FlashStorage::new(peripherals.FLASH);
-    let nvs_data = load_nvs_data(&mut flash);
+    let flash = FlashStorage::new(peripherals.FLASH);
+    {
+        let mut guard = NVS_FLASH.lock().await;
+        *guard = Some(flash);
+    }
+    let nvs_data = nvs_load().await;
     {
         let mut state = DEVICE_STATE.lock().await;
         state.threshold = nvs_data.config.threshold;
@@ -2096,7 +3282,11 @@ async fn main(spawner: Spawner) {
     );
     spawner.spawn(net_task(sta_runner).expect("net_task spawn"));
     spawner.spawn(ntp_task(sta_stack).expect("ntp_task spawn"));
-    spawner.spawn(pairing_test_task(sta_stack, seed).expect("pairing_test_task spawn"));
+    spawner.spawn(auth_task(sta_stack, seed).expect("auth_task spawn"));
+    spawner.spawn(rtdb_sse_listener_task(sta_stack, seed).expect("rtdb_sse_listener_task spawn"));
+    spawner.spawn(
+        rtdb_state_reporter_task(sta_stack, seed).expect("rtdb_state_reporter_task spawn"),
+    );
 
     if nvs_data.config.is_configured() && nvs_data.wifi.is_some() {
         println!(
@@ -2114,7 +3304,6 @@ async fn main(spawner: Spawner) {
     loop {
         let outcome = run_captive_portal(
             &mut controller,
-            &mut flash,
             &device_name,
             seed,
             allow_auto_countdown,
@@ -2134,16 +3323,18 @@ async fn main(spawner: Spawner) {
                             safety_off_min: state.safety_off_min,
                         }
                     };
-                    let updated = NvsData {
-                        config: cur_cfg,
-                        wifi: Some(candidate_creds),
-                    };
-                    if save_nvs_data(&mut flash, &updated).is_ok() {
+                    let save_res = nvs_update(|nvs| {
+                        nvs.config = cur_cfg;
+                        nvs.wifi = Some(candidate_creds);
+                        true
+                    })
+                    .await;
+                    if save_res.is_ok() {
                         println!("Verify-Before-Save: Wi-Fi verified and saved to NVS.");
                     } else {
                         println!("Verify-Before-Save: Wi-Fi connected, but NVS write failed.");
                     }
-                    sta_online_keepalive(sta_stack).await;
+                    sta_online_keepalive(sta_stack, &mut controller).await;
                 } else {
                     println!(
                         "Verify-Before-Save: Wi-Fi connection failed; NVS untouched. Returning to limitless AP."
@@ -2153,11 +3344,11 @@ async fn main(spawner: Spawner) {
                 }
             }
             PortalOutcome::TimeoutExpired => {
-                let latest_nvs = load_nvs_data(&mut flash);
+                let latest_nvs = nvs_load().await;
                 if let Some(saved_creds) = latest_nvs.wifi {
                     println!("300s AP window expired; connecting to saved Wi-Fi...");
                     if connect_sta_with_timeout(sta_stack, &mut controller, &saved_creds).await {
-                        sta_online_keepalive(sta_stack).await;
+                        sta_online_keepalive(sta_stack, &mut controller).await;
                     } else {
                         println!("Saved Wi-Fi connection failed; falling back to limitless AP.");
                         last_wifi_error = true;
