@@ -38,9 +38,6 @@ use embassy_sync::{
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_io_async::{Read as _, Write as _};
 use esp_backtrace as _;
-use esp_bootloader_esp_idf::partitions::{
-    DataPartitionSubType, PARTITION_TABLE_MAX_LEN, PartitionType, read_partition_table,
-};
 use esp_hal::{
     Async,
     gpio::{Input, Output},
@@ -97,8 +94,29 @@ const RTDB_HEARTBEAT_INTERVAL_SECS: u64 = 20;
 const SSE_READ_TIMEOUT_SECS: u64 = 60;
 const MAX_ID_TOKEN_LEN: usize = 1536;
 
-static NVS_FLASH: EmbassyMutex<CriticalSectionRawMutex, Option<FlashStorage<'static>>> =
-    EmbassyMutex::new(None);
+#[repr(align(4))]
+struct AlignedBuf<const N: usize>([u8; N]);
+
+struct NvsStorageState {
+    flash: Option<FlashStorage<'static>>,
+    nvs_offset: Option<u32>,
+    scratch_nvs: NvsData,
+    sector_buf: AlignedBuf<4096>,
+}
+
+impl NvsStorageState {
+    const fn new() -> Self {
+        Self {
+            flash: None,
+            nvs_offset: None,
+            scratch_nvs: NvsData::empty(),
+            sector_buf: AlignedBuf([0u8; 4096]),
+        }
+    }
+}
+
+static NVS_FLASH: EmbassyMutex<CriticalSectionRawMutex, NvsStorageState> =
+    EmbassyMutex::new(NvsStorageState::new());
 
 /// Fixed-capacity stack/static UTF-8 string buffer avoiding heap allocations.
 struct FixedBuf<const N: usize> {
@@ -193,6 +211,20 @@ impl Default for NvsData {
 }
 
 impl NvsData {
+    const fn empty() -> Self {
+        Self {
+            config: DeviceConfig {
+                threshold: 0,
+                sensitivity: 0,
+                duration: 0,
+                safety_off_min: 0,
+            },
+            wifi: None,
+            refresh_token: [0u8; MAX_REFRESH_TOKEN_LEN],
+            refresh_token_len: 0,
+        }
+    }
+
     fn refresh_token_str(&self) -> Option<&str> {
         let len = self.refresh_token_len as usize;
         if len == 0 || len > MAX_REFRESH_TOKEN_LEN {
@@ -274,15 +306,39 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// Resolves the NVS partition offset from the ESP-IDF partition table, or falls back to 0x9000.
-fn nvs_partition_offset(flash: &mut FlashStorage<'_>) -> u32 {
-    let mut pt_mem = [0u8; PARTITION_TABLE_MAX_LEN];
-    if let Ok(pt) = read_partition_table(flash, &mut pt_mem) {
-        if let Ok(Some(nvs)) = pt.find_partition(PartitionType::Data(DataPartitionSubType::Nvs)) {
-            return nvs.offset();
+/// Resolves and caches the NVS partition offset from `0x8000` using static word-aligned
+/// `sector_buf` (`read_nor`, zero stack sector allocation), falling back to `0x9000`.
+#[inline(never)]
+fn resolve_nvs_offset(state: &mut NvsStorageState) -> u32 {
+    if let Some(offset) = state.nvs_offset {
+        return offset;
+    }
+    const PARTITION_TABLE_OFFSET: u32 = 0x8000;
+    const PARTITION_TABLE_BYTES: usize = 0xC00;
+    const ENTRY_LEN: usize = 32;
+    const ENTRY_MAGIC: u16 = 0x50AA;
+    const TYPE_DATA: u8 = 0x01;
+    const SUBTYPE_NVS: u8 = 0x02;
+
+    let mut resolved = NVS_FALLBACK_OFFSET;
+    if let Some(flash) = state.flash.as_mut()
+        && flash
+            .read_nor(PARTITION_TABLE_OFFSET, &mut state.sector_buf.0)
+            .is_ok()
+    {
+        for entry in state.sector_buf.0[..PARTITION_TABLE_BYTES].chunks_exact(ENTRY_LEN) {
+            let magic = u16::from_le_bytes([entry[0], entry[1]]);
+            if magic != ENTRY_MAGIC {
+                break;
+            }
+            if entry[2] == TYPE_DATA && entry[3] == SUBTYPE_NVS {
+                resolved = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+                break;
+            }
         }
     }
-    NVS_FALLBACK_OFFSET
+    state.nvs_offset = Some(resolved);
+    resolved
 }
 
 /// Parses config and Wi-Fi credentials from the shared header bytes (bytes 5..124).
@@ -320,114 +376,144 @@ fn parse_nvs_config_and_wifi(buf: &[u8]) -> (DeviceConfig, Option<WifiCredential
     (config, wifi)
 }
 
-/// Reads and validates the `SLN3` (512-byte) NVS record, migrating legacy `SLN2` (128-byte) if present.
-fn load_nvs_data(flash: &mut FlashStorage<'_>) -> NvsData {
-    let offset = nvs_partition_offset(flash);
-    let mut buf = [0u8; NVS_RECORD_LEN];
-    if flash.read(offset, &mut buf).is_err() {
-        return NvsData::default();
+/// Reads and validates the `SLN3` (512-byte) NVS record into `state.scratch_nvs` using static
+/// word-aligned sector buffers (`read_nor`), migrating legacy `SLN2` (128-byte) if present.
+#[inline(never)]
+fn load_nvs_data(state: &mut NvsStorageState) {
+    state.scratch_nvs.config = DeviceConfig::default();
+    state.scratch_nvs.wifi = None;
+    state.scratch_nvs.clear_refresh_token();
+
+    let offset = resolve_nvs_offset(state);
+    let sector_base = offset & !(FlashStorage::SECTOR_SIZE - 1);
+    let in_sector = (offset - sector_base) as usize;
+    if in_sector + NVS_RECORD_LEN > state.sector_buf.0.len() {
+        return;
     }
+
+    let Some(flash) = state.flash.as_mut() else {
+        return;
+    };
+    if flash.read_nor(sector_base, &mut state.sector_buf.0).is_err() {
+        return;
+    }
+
+    let buf = &state.sector_buf.0[in_sector..in_sector + NVS_RECORD_LEN];
 
     if buf[0..4] == NVS_MAGIC && buf[4] == NVS_VERSION {
         let expected_crc = u32::from_le_bytes([buf[508], buf[509], buf[510], buf[511]]);
         if crc32(&buf[0..508]) != expected_crc {
-            return NvsData::default();
+            return;
         }
-        let (config, wifi) = parse_nvs_config_and_wifi(&buf);
+        let (config, wifi) = parse_nvs_config_and_wifi(buf);
+        state.scratch_nvs.config = config;
+        state.scratch_nvs.wifi = wifi;
         let rt_len = u16::from_le_bytes([buf[21], buf[22]]);
-        let mut refresh_token = [0u8; MAX_REFRESH_TOKEN_LEN];
-        let valid_rt_len = if (rt_len as usize) <= MAX_REFRESH_TOKEN_LEN
-            && core::str::from_utf8(&buf[124..124 + rt_len as usize]).is_ok()
+        if (rt_len as usize) <= MAX_REFRESH_TOKEN_LEN
+            && let Ok(rt_str) = core::str::from_utf8(&buf[124..124 + rt_len as usize])
         {
-            refresh_token[..rt_len as usize].copy_from_slice(&buf[124..124 + rt_len as usize]);
-            rt_len
-        } else {
-            0
-        };
-        return NvsData {
-            config,
-            wifi,
-            refresh_token,
-            refresh_token_len: valid_rt_len,
-        };
+            let _ = state.scratch_nvs.set_refresh_token(rt_str);
+        }
+        return;
     }
 
     if buf[0..4] == NVS_LEGACY_MAGIC && buf[4] == NVS_LEGACY_VERSION {
         let legacy_crc = u32::from_le_bytes([buf[124], buf[125], buf[126], buf[127]]);
         if fnv1a_32(&buf[0..NVS_LEGACY_RECORD_LEN - 4]) != legacy_crc {
-            return NvsData::default();
+            return;
         }
         let (config, wifi) = parse_nvs_config_and_wifi(&buf[..NVS_LEGACY_RECORD_LEN]);
-        let migrated = NvsData {
-            config,
-            wifi,
-            refresh_token: [0u8; MAX_REFRESH_TOKEN_LEN],
-            refresh_token_len: 0,
-        };
-        if save_nvs_data(flash, &migrated).is_ok() {
+        state.scratch_nvs.config = config;
+        state.scratch_nvs.wifi = wifi;
+        state.scratch_nvs.clear_refresh_token();
+        if save_nvs_data(state).is_ok() {
             println!("NVS: Migrated legacy SLN2 (128B) -> SLN3 (512B) with CRC32.");
         }
-        return migrated;
     }
-
-    NvsData::default()
 }
 
-/// Serializes and writes the 512-byte `SLN3` NVS record protected by CRC32.
-fn save_nvs_data(flash: &mut FlashStorage<'_>, data: &NvsData) -> Result<(), ()> {
-    let rt_len = data.refresh_token_len as usize;
+/// Serializes `state.scratch_nvs` and writes the 512-byte `SLN3` NVS record via static
+/// word-aligned `sector_buf` (`read_nor` + `erase` + `write_nor`, zero 4 KB stack allocation).
+#[inline(never)]
+fn save_nvs_data(state: &mut NvsStorageState) -> Result<(), ()> {
+    let rt_len = state.scratch_nvs.refresh_token_len as usize;
     if rt_len > MAX_REFRESH_TOKEN_LEN {
         return Err(());
     }
 
-    let mut buf = [0u8; NVS_RECORD_LEN];
-    buf[0..4].copy_from_slice(&NVS_MAGIC);
-    buf[4] = NVS_VERSION;
+    let offset = resolve_nvs_offset(state);
+    let sector_base = offset & !(FlashStorage::SECTOR_SIZE - 1);
+    let in_sector = (offset - sector_base) as usize;
+    if in_sector + NVS_RECORD_LEN > state.sector_buf.0.len() {
+        return Err(());
+    }
 
-    buf[8..10].copy_from_slice(&data.config.threshold.to_le_bytes());
-    buf[10..18].copy_from_slice(&data.config.duration.to_le_bytes());
-    buf[18] = data.config.sensitivity;
-    buf[19..21].copy_from_slice(&data.config.safety_off_min.to_le_bytes());
-    buf[21..23].copy_from_slice(&data.refresh_token_len.to_le_bytes());
-
-    if let Some(creds) = &data.wifi {
+    if let Some(creds) = &state.scratch_nvs.wifi {
         let ssid_bytes = creds.ssid.as_bytes();
         let pass_bytes = creds.password.as_bytes();
         if ssid_bytes.is_empty() || ssid_bytes.len() > 32 || pass_bytes.len() > 64 {
             return Err(());
         }
-        buf[5] = 1;
-        buf[6] = ssid_bytes.len() as u8;
-        buf[7] = pass_bytes.len() as u8;
-        buf[28..28 + ssid_bytes.len()].copy_from_slice(ssid_bytes);
-        buf[60..60 + pass_bytes.len()].copy_from_slice(pass_bytes);
     }
 
-    if rt_len > 0 {
-        buf[124..124 + rt_len].copy_from_slice(&data.refresh_token[..rt_len]);
+    let Some(flash) = state.flash.as_mut() else {
+        return Err(());
+    };
+    flash
+        .read_nor(sector_base, &mut state.sector_buf.0)
+        .map_err(|_| ())?;
+
+    {
+        let buf = &mut state.sector_buf.0[in_sector..in_sector + NVS_RECORD_LEN];
+        buf.fill(0);
+        buf[0..4].copy_from_slice(&NVS_MAGIC);
+        buf[4] = NVS_VERSION;
+
+        buf[8..10].copy_from_slice(&state.scratch_nvs.config.threshold.to_le_bytes());
+        buf[10..18].copy_from_slice(&state.scratch_nvs.config.duration.to_le_bytes());
+        buf[18] = state.scratch_nvs.config.sensitivity;
+        buf[19..21].copy_from_slice(&state.scratch_nvs.config.safety_off_min.to_le_bytes());
+        buf[21..23].copy_from_slice(&state.scratch_nvs.refresh_token_len.to_le_bytes());
+
+        if let Some(creds) = &state.scratch_nvs.wifi {
+            let ssid_bytes = creds.ssid.as_bytes();
+            let pass_bytes = creds.password.as_bytes();
+            buf[5] = 1;
+            buf[6] = ssid_bytes.len() as u8;
+            buf[7] = pass_bytes.len() as u8;
+            buf[28..28 + ssid_bytes.len()].copy_from_slice(ssid_bytes);
+            buf[60..60 + pass_bytes.len()].copy_from_slice(pass_bytes);
+        }
+
+        if rt_len > 0 {
+            buf[124..124 + rt_len].copy_from_slice(&state.scratch_nvs.refresh_token[..rt_len]);
+        }
+
+        let crc = crc32(&buf[0..508]);
+        buf[508..512].copy_from_slice(&crc.to_le_bytes());
     }
 
-    let crc = crc32(&buf[0..508]);
-    buf[508..512].copy_from_slice(&crc.to_le_bytes());
-
-    let offset = nvs_partition_offset(flash);
-    flash.write(offset, &buf).map_err(|_| ())
+    flash
+        .erase(sector_base, sector_base + FlashStorage::SECTOR_SIZE)
+        .map_err(|_| ())?;
+    flash
+        .write_nor(sector_base, &state.sector_buf.0)
+        .map_err(|_| ())
 }
 
-async fn nvs_load() -> NvsData {
-    let mut guard = NVS_FLASH.lock().await;
-    match guard.as_mut() {
-        Some(flash) => load_nvs_data(flash),
-        None => NvsData::default(),
-    }
+#[inline(never)]
+async fn nvs_read_with<R>(f: impl FnOnce(&NvsData) -> R) -> R {
+    let mut state = NVS_FLASH.lock().await;
+    load_nvs_data(&mut state);
+    f(&state.scratch_nvs)
 }
 
+#[inline(never)]
 async fn nvs_update<F: FnOnce(&mut NvsData) -> bool>(f: F) -> Result<bool, ()> {
-    let mut guard = NVS_FLASH.lock().await;
-    let flash = guard.as_mut().ok_or(())?;
-    let mut data = load_nvs_data(flash);
-    if f(&mut data) {
-        save_nvs_data(flash, &data)?;
+    let mut state = NVS_FLASH.lock().await;
+    load_nvs_data(&mut state);
+    if f(&mut state.scratch_nvs) {
+        save_nvs_data(&mut state)?;
         Ok(true)
     } else {
         Ok(false)
@@ -748,8 +834,22 @@ fn html_escape(input: &str) -> String {
     escaped
 }
 
-/// Builds the fixed-height (`--app-h`, keyboard-safe, zero-scroll) two-view Hungarian Captive Portal HTML/CSS/JS page.
-fn build_portal_html(
+/// Writes a single HTTP/1.1 chunk directly to the TCP socket (zero heap allocation).
+async fn write_http_chunk(socket: &mut TcpSocket<'_>, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    let mut hdr = FixedBuf::<24>::new();
+    let _ = write!(hdr, "{:X}\r\n", data.len());
+    let _ = socket.write_all(hdr.as_bytes()).await;
+    let _ = socket.write_all(data).await;
+    let _ = socket.write_all(b"\r\n").await;
+}
+
+/// Streams the fixed-height (`--app-h`, keyboard-safe, zero-scroll) two-view Hungarian Captive
+/// Portal HTML/CSS/JS page directly in HTTP chunks so no ~11-20 KB `String`/`Vec` is allocated on heap.
+async fn send_portal_html_chunked(
+    socket: &mut TcpSocket<'_>,
     device_name: &str,
     ssids: &[String],
     initial_view: &str,
@@ -757,7 +857,7 @@ fn build_portal_html(
     remaining_secs: Option<u64>,
     cfg: DeviceConfig,
     lamp_is_on: bool,
-) -> String {
+) {
     let safe_dev = html_escape(device_name);
     let (pre_th, pre_se, pre_du, pre_so) = if cfg.is_configured() {
         (cfg.threshold, cfg.sensitivity, cfg.duration, cfg.safety_off_min)
@@ -765,68 +865,90 @@ fn build_portal_html(
         (50, 50, 60, 0)
     };
 
-    let mut html = String::with_capacity(10240);
+    let _ = socket
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+        )
+        .await;
+
+    let mut chunk = FixedBuf::<1024>::new();
     let _ = write!(
-        html,
+        chunk,
         "<!DOCTYPE html><html lang='hu'><head><meta charset='utf-8'>\
          <meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>\
-         <title>{dev} – Captive Portal</title><style>\
-         *,*::before,*::after{{box-sizing:border-box}}\
-         html,body{{margin:0;padding:0;width:100%;height:var(--app-h,100vh);min-height:var(--app-h,100vh);overflow:hidden;\
-         background:#0f172a;color:#f1f5f9;font-family:system-ui,-apple-system,sans-serif;line-height:1.3}}\
-         button,select,input,a{{-webkit-tap-highlight-color:transparent;touch-action:manipulation;flex-shrink:0}}\
-         .page{{height:var(--app-h,100vh);min-height:var(--app-h,100vh);max-height:var(--app-h,100vh);overflow:hidden;\
-         display:flex;flex-direction:column;padding:12px 14px;width:100%;max-width:480px;margin:0 auto}}\
-         .page-main{{justify-content:space-between;gap:6px}}\
-         .page-config{{justify-content:flex-start}}\
-         .page>*,.cfg-card>*,.cfg-form>*{{flex-shrink:0}}\
-         .hidden{{display:none!important}}\
-         .hdr{{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-shrink:0}}\
-         .dev-title{{font-size:19px;font-weight:800;color:#f8fafc;letter-spacing:-0.01em;text-align:left}}\
-         .dev-id{{color:#38bdf8}}\
-         .link-btn{{width:auto;height:36px;padding:0 12px;margin:0;background:transparent;border:1px solid #475569;\
-         border-radius:8px;color:#93c5fd;font-size:14px;font-weight:600;cursor:pointer}}\
-         .warn{{background:#78350f;border:1px solid #f59e0b;color:#fef3c7;border-radius:8px;\
-         padding:8px 10px;font-size:13px;font-weight:600;line-height:1.3}}\
-         .grid2{{display:grid;grid-template-columns:1fr 1fr;gap:8px;flex-shrink:0}}\
-         .sec-lbl{{font-size:16px;font-weight:700;color:#e2e8f0;text-align:left}}\
-         select,input,button{{width:100%;height:42px;padding:0 12px;margin:0;border-radius:8px;\
-         border:1px solid #475569;background:#1e293b;color:#f8fafc;font-size:15px}}\
-         button{{background:#2563eb;border:none;height:44px;font-size:15px;font-weight:700;cursor:pointer}}\
-         button:disabled{{background:#334155;color:#94a3b8;cursor:not-allowed}}\
-         .btn-sec{{background:#334155}}\
-         .btn-warn{{background:#b45309;height:38px;font-size:14px}}\
-         .btn-danger{{background:#b91c1c;height:38px;font-size:14px}}\
-         .btn-lamp-on{{background:#16a34a}}\
-         .btn-lamp-off{{background:#475569}}\
-         .err-slot{{height:36px;min-height:36px;display:flex;align-items:center;justify-content:center;\
-         text-align:center;font-size:13px;font-weight:600;line-height:1.3;flex-shrink:0}}\
-         .slot-err{{color:#f87171}}\
-         .slot-info{{color:#fbbf24}}\
-         .err-hidden{{visibility:hidden}}\
-         .sys-sec{{border-top:1px solid #334155;padding-top:8px;display:flex;flex-direction:column;gap:6px;flex-shrink:0}}\
-         .sys-lbl{{font-size:13px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.03em}}\
-         .cfg-card{{margin:auto 0;border:1px solid #334155;border-radius:12px;background:#1e293b;\
-         padding:16px;display:flex;flex-direction:column;gap:12px;flex-shrink:0}}\
-         .cfg-form{{display:flex;flex-direction:column;gap:12px;flex-shrink:0}}\
-         .param-row{{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-shrink:0}}\
-         .param-row label{{font-size:15px;font-weight:600;color:#e2e8f0;text-align:left;flex:1}}\
-         .param-inp{{width:88px;min-width:88px;max-width:88px;text-align:center;height:42px;padding:0 6px;\
-         font-size:16px;font-weight:700;background:#0f172a;border:1px solid #475569}}\
-         .hint{{font-size:13px;color:#94a3b8;line-height:1.35;min-height:36px}}\
-         .modal-bg{{position:fixed;inset:0;background:rgba(2,6,23,.78);display:flex;align-items:center;\
-         justify-content:center;padding:14px;z-index:50}}\
-         .modal-card{{width:100%;max-width:440px;background:#1e293b;border:1px solid #475569;\
-         border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:12px}}\
-         .modal-hdr{{display:flex;align-items:center;justify-content:space-between;gap:8px}}\
-         .modal-title{{font-size:17px;font-weight:700;color:#f8fafc}}\
-         .modal-x{{width:34px;height:34px;padding:0;border-radius:8px;background:#334155;color:#f8fafc;\
-         font-size:15px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0}}\
-         .modal-body{{font-size:14px;color:#cbd5e1;line-height:1.45}}\
-         .modal-body ol{{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:8px}}\
-         </style></head><body>",
+         <title>{dev} – Captive Portal</title><style>",
         dev = safe_dev
     );
+    write_http_chunk(socket, chunk.as_bytes()).await;
+
+    write_http_chunk(
+        socket,
+        b"*,*::before,*::after{box-sizing:border-box}\
+          html,body{margin:0;padding:0;width:100%;height:var(--app-h,100vh);min-height:var(--app-h,100vh);overflow:hidden;\
+          background:#0f172a;color:#f1f5f9;font-family:system-ui,-apple-system,sans-serif;line-height:1.3}\
+          button,select,input,a{-webkit-tap-highlight-color:transparent;touch-action:manipulation;flex-shrink:0}\
+          .page{height:var(--app-h,100vh);min-height:var(--app-h,100vh);max-height:var(--app-h,100vh);overflow:hidden;\
+          display:flex;flex-direction:column;padding:12px 14px;width:100%;max-width:480px;margin:0 auto}\
+          .page-main{justify-content:space-between;gap:6px}\
+          .page-config{justify-content:flex-start}\
+          .page>*,.cfg-card>*,.cfg-form>*{flex-shrink:0}\
+          .hidden{display:none!important}\
+          .hdr{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-shrink:0}\
+          .dev-title{font-size:19px;font-weight:800;color:#f8fafc;letter-spacing:-0.01em;text-align:left}\
+          .dev-id{color:#38bdf8}\
+          .link-btn{width:auto;height:36px;padding:0 12px;margin:0;background:transparent;border:1px solid #475569;\
+          border-radius:8px;color:#93c5fd;font-size:14px;font-weight:600;cursor:pointer}\
+          .warn{background:#78350f;border:1px solid #f59e0b;color:#fef3c7;border-radius:8px;\
+          padding:8px 10px;font-size:13px;font-weight:600;line-height:1.3}\
+          .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px;flex-shrink:0}\
+          .sec-lbl{font-size:16px;font-weight:700;color:#e2e8f0;text-align:left}",
+    )
+    .await;
+
+    write_http_chunk(
+        socket,
+        b"select,input,button{width:100%;height:42px;padding:0 12px;margin:0;border-radius:8px;\
+          border:1px solid #475569;background:#1e293b;color:#f8fafc;font-size:15px}\
+          button{background:#2563eb;border:none;height:44px;font-size:15px;font-weight:700;cursor:pointer}\
+          button:disabled{background:#334155;color:#94a3b8;cursor:not-allowed}\
+          .btn-sec{background:#334155}\
+          .btn-warn{background:#b45309;height:38px;font-size:14px}\
+          .btn-danger{background:#b91c1c;height:38px;font-size:14px}\
+          .btn-lamp-on{background:#16a34a}\
+          .btn-lamp-off{background:#475569}\
+          .err-slot{height:36px;min-height:36px;display:flex;align-items:center;justify-content:center;\
+          text-align:center;font-size:13px;font-weight:600;line-height:1.3;flex-shrink:0}\
+          .slot-err{color:#f87171}\
+          .slot-info{color:#fbbf24}\
+          .err-hidden{visibility:hidden}\
+          .sys-sec{border-top:1px solid #334155;padding-top:8px;display:flex;flex-direction:column;gap:6px;flex-shrink:0}\
+          .sys-lbl{font-size:13px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.03em}\
+          .cfg-card{margin:auto 0;border:1px solid #334155;border-radius:12px;background:#1e293b;\
+          padding:16px;display:flex;flex-direction:column;gap:12px;flex-shrink:0}\
+          .cfg-form{display:flex;flex-direction:column;gap:12px;flex-shrink:0}\
+          .param-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-shrink:0}",
+    )
+    .await;
+
+    write_http_chunk(
+        socket,
+        b".param-row label{font-size:15px;font-weight:600;color:#e2e8f0;text-align:left;flex:1}\
+          .param-inp{width:88px;min-width:88px;max-width:88px;text-align:center;height:42px;padding:0 6px;\
+          font-size:16px;font-weight:700;background:#0f172a;border:1px solid #475569}\
+          .hint{font-size:13px;color:#94a3b8;line-height:1.35;min-height:36px}\
+          .modal-bg{position:fixed;inset:0;background:rgba(2,6,23,.78);display:flex;align-items:center;\
+          justify-content:center;padding:14px;z-index:50}\
+          .modal-card{width:100%;max-width:440px;background:#1e293b;border:1px solid #475569;\
+          border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:12px}\
+          .modal-hdr{display:flex;align-items:center;justify-content:space-between;gap:8px}\
+          .modal-title{font-size:17px;font-weight:700;color:#f8fafc}\
+          .modal-x{width:34px;height:34px;padding:0;border-radius:8px;background:#334155;color:#f8fafc;\
+          font-size:15px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0}\
+          .modal-body{font-size:14px;color:#cbd5e1;line-height:1.45}\
+          .modal-body ol{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:8px}\
+          </style></head><body>",
+    )
+    .await;
 
     let view1_cls = if initial_view == "config" {
         "page page-main hidden"
@@ -838,191 +960,248 @@ fn build_portal_html(
     } else {
         "page page-config hidden"
     };
+    let lamp_text = if lamp_is_on { "Lámpa: BE" } else { "Lámpa: KI" };
+    let lamp_cls = if lamp_is_on { "btn-lamp-on" } else { "btn-lamp-off" };
 
-    let lamp_text = if lamp_is_on {
-        "Lámpa: BE"
-    } else {
-        "Lámpa: KI"
-    };
-    let lamp_cls = if lamp_is_on {
-        "btn-lamp-on"
-    } else {
-        "btn-lamp-off"
-    };
-    let (row9_cls, row9_txt) = if last_wifi_error {
-        ("err-slot slot-err", String::from("Sikertelen Wi-Fi csatlakozás."))
-    } else if let Some(secs) = remaining_secs {
-        (
-            "err-slot slot-info",
-            alloc::format!(
-                "Mentett WiFi hálózatot találtam. Csatlakozás {:02}:{:02} múlva",
-                secs / 60,
-                secs % 60
-            ),
-        )
-    } else {
-        ("err-slot err-hidden", String::from("\u{00a0}"))
-    };
-    let rem_js = match remaining_secs {
-        Some(s) => alloc::format!("{}", s),
-        None => String::from("null"),
-    };
-
-    // Main View (Főoldal) - Strictly Rows 1-9 + compact Rendszerműveletek
+    chunk.clear();
     let _ = write!(
-        html,
+        chunk,
         "<div id='view-main' class='{v1}'>\
          <div class='hdr'><span class='dev-title'>Eszköz: <span class='dev-id'>{dev}</span></span><button type='button' class='link-btn' onclick=\"openModal('helpModal')\">Segítség</button></div>\
-         <div class='warn'>FIGYELEM: Közvetlen eszköz beállítás és lámpa kapcsolás kizárólag a Wi-Fi hálózatra csatlakozás ELŐTT lehetséges. Utána csak Webapp-ból!</div>\
-         <div class='grid2'>\
+         <div class='warn'>FIGYELEM: Közvetlen eszköz beállítás és lámpa kapcsolás kizárólag a Wi-Fi hálózatra csatlakozás ELŐTT lehetséges. Utána csak Webapp-ból!</div>",
+        v1 = view1_cls,
+        dev = safe_dev,
+    );
+    write_http_chunk(socket, chunk.as_bytes()).await;
+
+    chunk.clear();
+    let _ = write!(
+        chunk,
+        "<div class='grid2'>\
            <button type='button' id='toggleLampBtn' class='{lcls}' onclick='toggleLamp()'>{ltxt}</button>\
            <button type='button' class='btn-sec' onclick=\"showView('config')\">Beállítások</button>\
          </div>\
          <div class='sec-lbl'>Wi-Fi hálózat beállítása</div>\
          <select name='ssid' id='ssid' onchange='validateWifiForm()'><option value=''>-- Válassz Wi-Fi hálózatot --</option>",
-        v1 = view1_cls,
-        dev = safe_dev,
         lcls = lamp_cls,
         ltxt = lamp_text,
     );
+    write_http_chunk(socket, chunk.as_bytes()).await;
+
     for s in ssids {
         let safe_s = html_escape(s);
-        let _ = write!(html, "<option value='{0}'>{0}</option>", safe_s);
+        chunk.clear();
+        let _ = write!(chunk, "<option value='{0}'>{0}</option>", safe_s);
+        write_http_chunk(socket, chunk.as_bytes()).await;
     }
+
+    chunk.clear();
     let _ = write!(
-        html,
+        chunk,
         "</select>\
          <button type='button' id='scanBtn' class='btn-sec' onclick='scanWifi()'>Wi-Fi lista frissítése</button>\
          <input type='password' name='pass' id='pass' maxlength='64' autocomplete='new-password' placeholder='Wi-Fi jelszó' oninput='validateWifiForm()'>\
-         <button type='button' id='connectBtn' onclick='openWifiConfirm()' disabled>Csatlakozás és Mentés</button>\
-         <div id='wifi-err-slot' class='{rcls}'>{rtxt}</div>\
-         <div class='sys-sec'><div class='sys-lbl'>Rendszerműveletek</div><div class='grid2'>\
-           <button type='button' id='clearWifiBtn' class='btn-warn' onclick='clearWifi()'>Wi-Fi adatok törlése</button>\
-           <button type='button' id='restartBtn' class='btn-danger' onclick='restartDevice()'>Újraindítás</button>\
-         </div></div></div>",
-        rcls = row9_cls,
-        rtxt = row9_txt
+         <button type='button' id='connectBtn' onclick='openWifiConfirm()' disabled>Csatlakozás és Mentés</button>"
     );
+    write_http_chunk(socket, chunk.as_bytes()).await;
 
-    // Config View (Config oldal) - 3 vertical zones: Top Header, Vertically Centered Framed Card, Bottom Button
+    chunk.clear();
+    if last_wifi_error {
+        let _ = chunk.write_str(
+            "<div id='wifi-err-slot' class='err-slot slot-err'>Sikertelen Wi-Fi csatlakozás.</div>",
+        );
+    } else if let Some(secs) = remaining_secs {
+        let _ = write!(
+            chunk,
+            "<div id='wifi-err-slot' class='err-slot slot-info'>Mentett WiFi hálózatot találtam. Csatlakozás {:02}:{:02} múlva</div>",
+            secs / 60,
+            secs % 60
+        );
+    } else {
+        let _ = chunk.write_str(
+            "<div id='wifi-err-slot' class='err-slot err-hidden'>\u{00a0}</div>",
+        );
+    }
+    let _ = chunk.write_str(
+        "<div class='sys-sec'><div class='sys-lbl'>Rendszerműveletek</div><div class='grid2'>\
+         <button type='button' id='clearWifiBtn' class='btn-warn' onclick='clearWifi()'>Wi-Fi adatok törlése</button>\
+         <button type='button' id='restartBtn' class='btn-danger' onclick='restartDevice()'>Újraindítás</button>\
+         </div></div></div>",
+    );
+    write_http_chunk(socket, chunk.as_bytes()).await;
+
+    chunk.clear();
     let _ = write!(
-        html,
+        chunk,
         "<div id='view-config' class='{v2}'>\
          <div class='hdr'><span class='dev-title'>Eszköz: <span class='dev-id'>{dev}</span></span><button type='button' class='link-btn' onclick=\"openModal('helpModal')\">Segítség</button></div>\
-         <div class='cfg-card'>\
-           <div class='sec-lbl'>Működési paraméterek beállítása</div>\
-           <form id='cfgForm' class='cfg-form' onsubmit='saveConfig(event)'>\
-             <div class='param-row'><label for='threshold'>Fény érzékenység 1 - 100</label><input type='number' id='threshold' name='threshold' class='param-inp' min='1' max='100' value='{th}' required></div>\
-             <div class='param-row'><label for='sensitivity'>Mozgás érzékenység 1 - 100</label><input type='number' id='sensitivity' name='sensitivity' class='param-inp' min='1' max='100' value='{se}' required></div>\
-             <div class='param-row'><label for='duration'>Késleltetés (mp) 10 - 600</label><input type='number' id='duration' name='duration' class='param-inp' min='10' max='600' value='{du}' required></div>\
-             <div class='param-row'><label for='safety_off_min'>Auto kikapcs (p)</label><input type='number' id='safety_off_min' name='safety_off_min' class='param-inp' min='0' max='1440' value='{so}' required></div>\
-             <div class='hint'>Manuális lámpa kapcsolás biztonsági kikapcsolási időzítője. Hagyd nullán, hogy soha ne kapcsolja le!</div>\
-             <button type='submit' id='saveCfgBtn'>Beállítások mentése</button>\
-           </form>\
-         </div>\
-         <button type='button' class='btn-sec' onclick=\"showView('main')\">Vissza a Wi-Fi beállításokhoz</button>\
-         </div>",
+         <div class='cfg-card'><div class='sec-lbl'>Működési paraméterek beállítása</div><form id='cfgForm' class='cfg-form' onsubmit='saveConfig(event)'>",
         v2 = view2_cls,
         dev = safe_dev,
+    );
+    write_http_chunk(socket, chunk.as_bytes()).await;
+
+    chunk.clear();
+    let _ = write!(
+        chunk,
+        "<div class='param-row'><label for='threshold'>Fény érzékenység 1 - 100</label><input type='number' id='threshold' name='threshold' class='param-inp' min='1' max='100' value='{th}' required></div>\
+         <div class='param-row'><label for='sensitivity'>Mozgás érzékenység 1 - 100</label><input type='number' id='sensitivity' name='sensitivity' class='param-inp' min='1' max='100' value='{se}' required></div>",
         th = pre_th,
         se = pre_se,
+    );
+    write_http_chunk(socket, chunk.as_bytes()).await;
+
+    chunk.clear();
+    let _ = write!(
+        chunk,
+        "<div class='param-row'><label for='duration'>Késleltetés (mp) 10 - 600</label><input type='number' id='duration' name='duration' class='param-inp' min='10' max='600' value='{du}' required></div>\
+         <div class='param-row'><label for='safety_off_min'>Auto kikapcs (p)</label><input type='number' id='safety_off_min' name='safety_off_min' class='param-inp' min='0' max='1440' value='{so}' required></div>",
         du = pre_du,
         so = pre_so,
     );
+    write_http_chunk(socket, chunk.as_bytes()).await;
 
-    // Help Modal ("Beüzemelési és Párosítási Útmutató") & Wi-Fi Confirmation Modal
-    let _ = write!(
-        html,
+    write_http_chunk(
+        socket,
+        "<div class='hint'>Manuális lámpa kapcsolás biztonsági kikapcsolási időzítője. Hagyd nullán, hogy soha ne kapcsolja le!</div>\
+          <button type='submit' id='saveCfgBtn'>Beállítások mentése</button>\
+          </form></div>\
+          <button type='button' class='btn-sec' onclick=\"showView('main')\">Vissza a Wi-Fi beállításokhoz</button>\
+          </div>".as_bytes(),
+    )
+    .await;
+
+    write_http_chunk(
+        socket,
         "<div id='helpModal' class='modal-bg hidden' onclick=\"backdropClose(event,'helpModal')\">\
-           <div class='modal-card' role='dialog' aria-modal='true'>\
-             <div class='modal-hdr'>\
-               <span class='modal-title'>Beüzemelési és Párosítási Útmutató</span>\
-               <button type='button' class='modal-x' aria-label='Bezárás' onclick=\"closeModal('helpModal')\">X</button>\
-             </div>\
-             <div class='modal-body'><ol>\
-               <li><strong>Működési paraméterek:</strong> A <em>Beállítások</em> gombra kattintva állítsd be a fényérzékenységet (1–100), mozgásérzékenységet (1–100), késleltetést (10–600 mp) és az opcionális manuális auto-kikapcsolást (perc, 0 = kikapcsolva), majd mentsd el.</li>\
-               <li><strong>Helyi Wi-Fi csatlakozás:</strong> A főoldalon frissítsd a listát, válaszd ki az otthoni Wi-Fi hálózatot, írd be a jelszót, majd kattints a <em>Csatlakozás és Mentés</em> gombra.</li>\
-               <li><strong>Webapp párosítás:</strong> Sikeres Wi-Fi csatlakozás után az eszköz kilép AP módból. Nyisd meg a SmartLight Webappot, és párosítsd a(z) <strong>{dev}</strong> eszközt az eszközön található 10 karakteres biztonsági kóddal az 5 perces párosítási ablakban.</li>\
-             </ol></div>\
-           </div>\
-         </div>\
-         <div id='wifiConfirmModal' class='modal-bg hidden' onclick=\"backdropClose(event,'wifiConfirmModal')\">\
+          <div class='modal-card' role='dialog' aria-modal='true'>\
+            <div class='modal-hdr'>\
+              <span class='modal-title'>Beüzemelési és Párosítási Útmutató</span>\
+              <button type='button' class='modal-x' aria-label='Bezárás' onclick=\"closeModal('helpModal')\">X</button>\
+            </div>\
+            <div class='modal-body'><ol>\
+              <li><strong>Működési paraméterek:</strong> A <em>Beállítások</em> gombra kattintva állítsd be a fényérzékenységet (1–100), mozgásérzékenységet (1–100), késleltetést (10–600 mp) és az opcionális manuális auto-kikapcsolást (perc, 0 = kikapcsolva), majd mentsd el.</li>\
+              <li><strong>Helyi Wi-Fi csatlakozás:</strong> A főoldalon frissítsd a listát, válaszd ki az otthoni Wi-Fi hálózatot, írd be a jelszót, majd kattints a <em>Csatlakozás és Mentés</em> gombra.</li>".as_bytes(),
+    )
+    .await;
+
+    chunk.clear();
+    let _ = write!(
+        chunk,
+        "<li><strong>Webapp párosítás:</strong> Sikeres Wi-Fi csatlakozás után az eszköz kilép AP módból. Nyisd meg a SmartLight Webappot, és párosítsd a(z) <strong>{dev}</strong> eszközt az eszközön található 10 karakteres biztonsági kóddal az 5 perces párosítási ablakban.</li>\
+         </ol></div></div></div>",
+        dev = safe_dev,
+    );
+    write_http_chunk(socket, chunk.as_bytes()).await;
+
+    chunk.clear();
+    let _ = write!(
+        chunk,
+        "<div id='wifiConfirmModal' class='modal-bg hidden' onclick=\"backdropClose(event,'wifiConfirmModal')\">\
            <div class='modal-card' role='dialog' aria-modal='true'>\
              <div class='modal-hdr'>\
                <span class='modal-title'>Wi-Fi csatlakozás megerősítése</span>\
                <button type='button' class='modal-x' aria-label='Bezárás' onclick=\"closeModal('wifiConfirmModal')\">X</button>\
              </div>\
-             <div class='modal-body'>A csatlakozás sikerességét jelzi, ha a telefon visszavált a helyi hálózatra és eltűnik a WiFi hálózatok listájáról az eszköz. Ekkor megkezdhető a Webappon a párosítás. Ha sikertelen a csatlakozás, ez a felület újra elérhetővé válik a(z) {dev} eszköz WiFi-jére csatlakozva és a 192.168.4.1 webcímen.</div>\
-             <button type='button' id='confirmConnectBtn' onclick='confirmAndSubmitWifi()'>Csatlakozás indítása</button>\
-           </div>\
-         </div>",
-        dev = safe_dev
+             <div class='modal-body'>A csatlakozás sikerességét jelzi, ha a telefon visszavált a helyi hálózatra és eltűnik a WiFi hálózatok listájáról az eszköz. Ekkor megkezdhető a Webappon a párosítás. Ha sikertelen a csatlakozás, ez a felület újra elérhetővé válik a(z) {dev} eszköz WiFi-jére csatlakozva és a 192.168.4.1 webcímen.</div>",
+        dev = safe_dev,
     );
+    write_http_chunk(socket, chunk.as_bytes()).await;
 
+    write_http_chunk(
+        socket,
+        "<button type='button' id='confirmConnectBtn' onclick='confirmAndSubmitWifi()'>Csatlakozás indítása</button>\
+           </div>\
+         </div>".as_bytes(),
+    )
+    .await;
+
+    chunk.clear();
     let _ = write!(
-        html,
+        chunk,
         "<script>\
          let initH=window.innerHeight;\
          function setAppH(h){{initH=h;document.documentElement.style.setProperty('--app-h',initH+'px');}}\
          setAppH(initH);\
          window.addEventListener('resize',()=>{{if(window.innerHeight>initH)setAppH(window.innerHeight);}});\
          window.addEventListener('orientationchange',()=>{{setTimeout(()=>{{setAppH(window.innerHeight);}},250);}});\
-         let wifiErr={werr};let remSecs={rem};\
-         function fmtMmSs(s){{const m=Math.floor(s/60),sec=s%60;return String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0');}}\
-         function renderRow9(){{const el=document.getElementById('wifi-err-slot');\
-         if(wifiErr){{el.className='err-slot slot-err';el.textContent='Sikertelen Wi-Fi csatlakozás.';}}\
-         else if(remSecs!==null&&remSecs>=0){{el.className='err-slot slot-info';el.textContent='Mentett WiFi hálózatot találtam. Csatlakozás '+fmtMmSs(remSecs)+' múlva';}}\
-         else{{el.className='err-slot err-hidden';el.textContent='\\u00a0';}}}}\
-         renderRow9();\
-         setInterval(()=>{{if(!wifiErr&&remSecs!==null&&remSecs>0){{remSecs--;renderRow9();}}}},1000);\
-         function showView(v){{document.getElementById('view-main').classList.toggle('hidden',v!=='main');\
-         document.getElementById('view-config').classList.toggle('hidden',v!=='config');}}\
-         function openModal(id){{document.getElementById(id).classList.remove('hidden');}}\
-         function closeModal(id){{document.getElementById(id).classList.add('hidden');}}\
-         function backdropClose(e,id){{if(e.target&&e.target.id===id)closeModal(id);}}\
-         document.addEventListener('keydown',e=>{{if(e.key==='Escape'){{closeModal('helpModal');closeModal('wifiConfirmModal');}}}});\
-         function validateWifiForm(){{const s=document.getElementById('ssid').value,p=document.getElementById('pass').value;\
-         document.getElementById('connectBtn').disabled=!(s&&s.length>0&&p.length>0);}}\
-         function updateLampUi(on){{const btn=document.getElementById('toggleLampBtn');\
-         btn.textContent=on?'Lámpa: BE':'Lámpa: KI';btn.className=on?'btn-lamp-on':'btn-lamp-off';}}\
-         setInterval(async()=>{{try{{const r=await fetch('/status');if(!r.ok)return;const d=await r.json();\
-         updateLampUi(d.lamp_is_on);wifiErr=!!d.wifi_error;remSecs=(typeof d.remaining_secs==='number')?d.remaining_secs:null;renderRow9();}}catch(_){{}}}},5000);\
-         async function scanWifi(){{const btn=document.getElementById('scanBtn'),sel=document.getElementById('ssid');\
-         btn.disabled=true;btn.textContent='Keresés...';\
-         try{{const r=await fetch('/scan?refresh=1');const arr=await r.json();const cur=sel.value;\
-         sel.innerHTML=\"<option value=''>-- Válassz Wi-Fi hálózatot --</option>\";\
-         arr.forEach(s=>{{const o=document.createElement('option');o.value=s;o.textContent=s;if(s===cur)o.selected=true;sel.appendChild(o);}});\
-         validateWifiForm();}}catch(_){{}}\
-         btn.disabled=false;btn.textContent='Wi-Fi lista frissítése';}}\
-         function openWifiConfirm(){{const s=document.getElementById('ssid').value,p=document.getElementById('pass').value;\
-         if(!s||!p)return;openModal('wifiConfirmModal');}}\
-         async function confirmAndSubmitWifi(){{const ssid=document.getElementById('ssid').value,pass=document.getElementById('pass').value;\
-         if(!ssid||!pass)return;const cb=document.getElementById('confirmConnectBtn');cb.disabled=true;cb.textContent='Csatlakozás folyamatban...';\
-         document.getElementById('connectBtn').disabled=true;wifiErr=false;remSecs=null;renderRow9();\
-         try{{await fetch('/connect-wifi',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{ssid,pass}})}});}}catch(_){{}}}}\
-         async function clearWifi(){{const btn=document.getElementById('clearWifiBtn');btn.disabled=true;\
-         try{{const r=await fetch('/clear-wifi',{{method:'POST'}});if(r.ok){{wifiErr=false;remSecs=null;renderRow9();btn.textContent='Törölve';\
-         setTimeout(()=>{{btn.textContent='Wi-Fi adatok törlése';btn.disabled=false;}},1500);return;}}}}catch(_){{}}\
-         btn.disabled=false;}}\
-         async function restartDevice(){{const btn=document.getElementById('restartBtn');btn.disabled=true;btn.textContent='Újraindítás...';\
-         try{{await fetch('/restart',{{method:'POST'}});}}catch(_){{}}}}\
-         async function toggleLamp(){{try{{const r=await fetch('/toggle-lamp',{{method:'POST'}});const d=await r.json();\
-         if(d.ok)updateLampUi(d.lamp_is_on);}}catch(_){{}}}}\
-         async function saveConfig(e){{e.preventDefault();const btn=document.getElementById('saveCfgBtn');\
-         const payload={{threshold:+document.getElementById('threshold').value,sensitivity:+document.getElementById('sensitivity').value,\
-         duration:+document.getElementById('duration').value,safety_off_min:+document.getElementById('safety_off_min').value}};\
-         if(payload.threshold<1||payload.threshold>100||payload.sensitivity<1||payload.sensitivity>100||\
-         payload.duration<10||payload.duration>600||payload.safety_off_min<0||payload.safety_off_min>1440){{\
-         btn.textContent='Érvénytelen értékek!';setTimeout(()=>{{btn.textContent='Beállítások mentése';}},1500);return;}}\
-         btn.disabled=true;try{{const r=await fetch('/save-config',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});\
-         const d=await r.json();btn.textContent=d.ok?'Mentve!':'Hiba a mentésnél!';}}catch(_){{btn.textContent='Hiba!';}}\
-         setTimeout(()=>{{btn.textContent='Beállítások mentése';btn.disabled=false;}},1500);}}\
-         </script></body></html>",
+         let wifiErr={werr};let remSecs=",
         werr = last_wifi_error,
-        rem = rem_js
     );
+    if let Some(s) = remaining_secs {
+        let _ = write!(chunk, "{};", s);
+    } else {
+        let _ = chunk.write_str("null;");
+    }
+    write_http_chunk(socket, chunk.as_bytes()).await;
 
-    html
+    write_http_chunk(
+        socket,
+        "function fmtMmSs(s){const m=Math.floor(s/60),sec=s%60;return String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0');}\
+          function renderRow9(){const el=document.getElementById('wifi-err-slot');\
+          if(wifiErr){el.className='err-slot slot-err';el.textContent='Sikertelen Wi-Fi csatlakozás.';}\
+          else if(remSecs!==null&&remSecs>=0){el.className='err-slot slot-info';el.textContent='Mentett WiFi hálózatot találtam. Csatlakozás '+fmtMmSs(remSecs)+' múlva';}\
+          else{el.className='err-slot err-hidden';el.textContent='\\u00a0';}}\
+          renderRow9();\
+          setInterval(()=>{if(!wifiErr&&remSecs!==null&&remSecs>0){remSecs--;renderRow9();}},1000);\
+          function showView(v){document.getElementById('view-main').classList.toggle('hidden',v!=='main');\
+          document.getElementById('view-config').classList.toggle('hidden',v!=='config');}\
+          function openModal(id){document.getElementById(id).classList.remove('hidden');}\
+          function closeModal(id){document.getElementById(id).classList.add('hidden');}\
+          function backdropClose(e,id){if(e.target&&e.target.id===id)closeModal(id);}\
+          document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeModal('helpModal');closeModal('wifiConfirmModal');}});\
+          function validateWifiForm(){const s=document.getElementById('ssid').value,p=document.getElementById('pass').value;\
+          document.getElementById('connectBtn').disabled=!(s&&s.length>0&&p.length>0);}\
+          function updateLampUi(on){const btn=document.getElementById('toggleLampBtn');\
+          btn.textContent=on?'Lámpa: BE':'Lámpa: KI';btn.className=on?'btn-lamp-on':'btn-lamp-off';}".as_bytes(),
+    )
+    .await;
+
+    write_http_chunk(
+        socket,
+        "setInterval(async()=>{try{const r=await fetch('/status');if(!r.ok)return;const d=await r.json();\
+          updateLampUi(d.lamp_is_on);wifiErr=!!d.wifi_error;remSecs=(typeof d.remaining_secs==='number')?d.remaining_secs:null;renderRow9();}catch(_){}},5000);\
+          async function scanWifi(){const btn=document.getElementById('scanBtn'),sel=document.getElementById('ssid');\
+          btn.disabled=true;btn.textContent='Keresés...';\
+          try{const r=await fetch('/scan?refresh=1');const arr=await r.json();const cur=sel.value;\
+          sel.innerHTML=\"<option value=''>-- Válassz Wi-Fi hálózatot --</option>\";\
+          arr.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;if(s===cur)o.selected=true;sel.appendChild(o);});\
+          validateWifiForm();}catch(_){}\
+          btn.disabled=false;btn.textContent='Wi-Fi lista frissítése';}\
+          function openWifiConfirm(){const s=document.getElementById('ssid').value,p=document.getElementById('pass').value;\
+          if(!s||!p)return;openModal('wifiConfirmModal');}\
+          async function confirmAndSubmitWifi(){const ssid=document.getElementById('ssid').value,pass=document.getElementById('pass').value;\
+          if(!ssid||!pass)return;const cb=document.getElementById('confirmConnectBtn');cb.disabled=true;cb.textContent='Csatlakozás folyamatban...';\
+          document.getElementById('connectBtn').disabled=true;wifiErr=false;remSecs=null;renderRow9();\
+          try{await fetch('/connect-wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,pass})});}catch(_){}}\
+          async function clearWifi(){const btn=document.getElementById('clearWifiBtn');btn.disabled=true;\
+          try{const r=await fetch('/clear-wifi',{method:'POST'});if(r.ok){wifiErr=false;remSecs=null;renderRow9();btn.textContent='Törölve';\
+          setTimeout(()=>{btn.textContent='Wi-Fi adatok törlése';btn.disabled=false;},1500);return;}}catch(_){}\
+          btn.disabled=false;}".as_bytes(),
+    )
+    .await;
+
+    write_http_chunk(
+        socket,
+        "async function restartDevice(){const btn=document.getElementById('restartBtn');btn.disabled=true;btn.textContent='Újraindítás...';\
+          try{await fetch('/restart',{method:'POST'});}catch(_){}}\
+          async function toggleLamp(){try{const r=await fetch('/toggle-lamp',{method:'POST'});const d=await r.json();\
+          if(d.ok)updateLampUi(d.lamp_is_on);}catch(_){}}\
+          async function saveConfig(e){e.preventDefault();const btn=document.getElementById('saveCfgBtn');\
+          const payload={threshold:+document.getElementById('threshold').value,sensitivity:+document.getElementById('sensitivity').value,\
+          duration:+document.getElementById('duration').value,safety_off_min:+document.getElementById('safety_off_min').value};\
+          if(payload.threshold<1||payload.threshold>100||payload.sensitivity<1||payload.sensitivity>100||\
+          payload.duration<10||payload.duration>600||payload.safety_off_min<0||payload.safety_off_min>1440){\
+          btn.textContent='Érvénytelen értékek!';setTimeout(()=>{btn.textContent='Beállítások mentése';},1500);return;}\
+          btn.disabled=true;try{const r=await fetch('/save-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});\
+          const d=await r.json();btn.textContent=d.ok?'Mentve!':'Hiba a mentésnél!';}catch(_){btn.textContent='Hiba!';}\
+          setTimeout(()=>{btn.textContent='Beállítások mentése';btn.disabled=false;},1500);}\
+          </script></body></html>".as_bytes(),
+    )
+    .await;
+
+    let _ = socket.write_all(b"0\r\n\r\n").await;
+    let _ = socket.flush().await;
 }
 
 async fn send_http_response(
@@ -1079,21 +1258,25 @@ async fn http_portal_server(
     ap_deadline: &EmbassyMutex<CriticalSectionRawMutex, Option<Instant>>,
     last_wifi_error: &mut bool,
 ) -> WifiCredentials {
-    let mut rx_buf = [0u8; 2048];
-    let mut tx_buf = [0u8; 4096];
     let mut cached_ssids = initial_ssids;
+    // Reuse idle SSE_SCRATCH TLS RX buffer (16.6 KB) during SoftAP portal mode so
+    // ___embassy_main::POOL reserves zero permanent .bss for portal socket buffers.
+    let mut portal_bufs = SSE_SCRATCH.lock().await;
+    let (rx_buf, rest) = portal_bufs.tls_rx.split_at_mut(2048);
+    let (tx_buf, rest) = rest.split_at_mut(4096);
+    let (req_buf, _) = rest.split_at_mut(3072);
 
     loop {
-        let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
+        let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
         socket.set_timeout(Some(Duration::from_secs(10)));
 
         if socket.accept(80).await.is_err() {
             continue;
         }
 
-        let mut req_buf = [0u8; 2048];
         let mut total = 0usize;
         let mut payload_too_large = false;
+        let mut parsed_content_len = 0usize;
         loop {
             match socket.read(&mut req_buf[total..]).await {
                 Ok(0) | Err(_) => break,
@@ -1102,7 +1285,7 @@ async fn http_portal_server(
                     if let Ok(s) = core::str::from_utf8(&req_buf[..total]) {
                         if let Some(hdr_end) = s.find("\r\n\r\n") {
                             let body_received = total - (hdr_end + 4);
-                            let content_len = s[..hdr_end]
+                            parsed_content_len = s[..hdr_end]
                                 .lines()
                                 .find_map(|line| {
                                     let lower_eq = line
@@ -1116,13 +1299,13 @@ async fn http_portal_server(
                                     }
                                 })
                                 .unwrap_or(0);
-                            if content_len > MAX_POST_BODY_BYTES
+                            if parsed_content_len > MAX_POST_BODY_BYTES
                                 || body_received > MAX_POST_BODY_BYTES
                             {
                                 payload_too_large = true;
                                 break;
                             }
-                            if total >= hdr_end + 4 + content_len {
+                            if total >= hdr_end + 4 + parsed_content_len {
                                 break;
                             }
                         }
@@ -1150,12 +1333,18 @@ async fn http_portal_server(
             let method = parts.next().unwrap_or("GET");
             let raw_path = parts.next().unwrap_or("/");
             let path = raw_path.split('?').next().unwrap_or("/");
-            let body = req_str.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+            let raw_body = req_str.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+            let body = if parsed_content_len > 0 && raw_body.len() >= parsed_content_len {
+                &raw_body[..parsed_content_len]
+            } else {
+                raw_body
+            };
 
             match (method, path) {
                 ("GET", "/status") => {
-                    let nvs = nvs_load().await;
-                    let saved_ssid = nvs.wifi.as_ref().map(|w| w.ssid.as_str()).unwrap_or("");
+                    let (has_saved_wifi, saved_ssid_opt) =
+                        nvs_read_with(|nvs| (nvs.wifi.is_some(), nvs.wifi.as_ref().map(|w| w.ssid.clone()))).await;
+                    let saved_ssid = saved_ssid_opt.as_deref().unwrap_or("");
                     let remaining_secs = {
                         let dl_opt = *ap_deadline.lock().await;
                         dl_opt.map(|dl| {
@@ -1170,7 +1359,7 @@ async fn http_portal_server(
                     let state = DEVICE_STATE.lock().await;
                     let status = PortalStatusJson {
                         device_name,
-                        has_saved_wifi: nvs.wifi.is_some(),
+                        has_saved_wifi,
                         saved_ssid,
                         wifi_error: *last_wifi_error,
                         remaining_secs,
@@ -1198,7 +1387,7 @@ async fn http_portal_server(
                         serde_json::to_string(&cached_ssids).unwrap_or_else(|_| String::from("[]"));
                     send_http_response(&mut socket, "200 OK", "application/json", &json).await;
                 }
-                ("POST", "/connect-wifi") | ("POST", "/save") => {
+                ("POST", "/connect-wifi") | ("POST", "/wifi") | ("POST", "/save") => {
                     if let Some(creds) = parse_wifi_submit(body) {
                         println!(
                             "PORTAL: Received candidate Wi-Fi '{}' (Verify-Before-Save, not written to NVS yet).",
@@ -1348,7 +1537,8 @@ async fn http_portal_server(
                         )
                     };
                     let initial_view = if path == "/config" { "config" } else { "main" };
-                    let html = build_portal_html(
+                    send_portal_html_chunked(
+                        &mut socket,
                         device_name,
                         &cached_ssids,
                         initial_view,
@@ -1356,12 +1546,6 @@ async fn http_portal_server(
                         remaining_secs,
                         cfg,
                         lamp_is_on,
-                    );
-                    send_http_response(
-                        &mut socket,
-                        "200 OK",
-                        "text/html; charset=utf-8",
-                        &html,
                     )
                     .await;
                 }
@@ -1408,7 +1592,7 @@ static NTP_TIME: Mutex<RefCell<Option<NtpSyncState>>> = Mutex::new(RefCell::new(
 
 const TLS_RX_BUF_LEN: usize = 16640;
 const TLS_TX_BUF_LEN: usize = 16640;
-const HTTP_RX_BUF_LEN: usize = 6144;
+const HTTP_RX_BUF_LEN: usize = 4608;
 const NTP_SERVER: &str = "pool.ntp.org";
 const NTP_PORT: u16 = 123;
 const NTP_TO_UNIX_EPOCH: u64 = 2_208_988_800;
@@ -1507,11 +1691,45 @@ fn next_tls_seed(base: u64) -> u64 {
     base ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum HttpsExtraHeader {
+    None,
+    EspAuthToken,
+    FormUrlEncoded,
+}
+
+struct HttpsJob {
+    method: Method,
+    extra_header: HttpsExtraHeader,
+    json_content_type: bool,
+    has_body: bool,
+    status: u16,
+    resp_len: usize,
+    err: Option<&'static str>,
+}
+
+impl HttpsJob {
+    const fn new() -> Self {
+        Self {
+            method: Method::GET,
+            extra_header: HttpsExtraHeader::None,
+            json_content_type: false,
+            has_body: false,
+            status: 0,
+            resp_len: 0,
+            err: None,
+        }
+    }
+}
+
 struct HttpsScratch {
-    tcp_state: TcpClientState<1, 2048, 2048>,
+    tcp_state: TcpClientState<1, 1536, 1536>,
     tls_rx: [u8; TLS_RX_BUF_LEN],
     tls_tx: [u8; TLS_TX_BUF_LEN],
     http_rx: [u8; HTTP_RX_BUF_LEN],
+    url_buf: FixedBuf<1792>,
+    req_buf: FixedBuf<1280>,
+    job: HttpsJob,
 }
 
 impl HttpsScratch {
@@ -1521,20 +1739,27 @@ impl HttpsScratch {
             tls_rx: [0u8; TLS_RX_BUF_LEN],
             tls_tx: [0u8; TLS_TX_BUF_LEN],
             http_rx: [0u8; HTTP_RX_BUF_LEN],
+            url_buf: FixedBuf::new(),
+            req_buf: FixedBuf::new(),
+            job: HttpsJob::new(),
         }
     }
 }
 
+static HTTPS_CALL_LOCK: EmbassyMutex<CriticalSectionRawMutex, ()> = EmbassyMutex::new(());
+static HTTPS_GO_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static HTTPS_DONE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static HTTPS_SCRATCH: EmbassyMutex<CriticalSectionRawMutex, HttpsScratch> =
     EmbassyMutex::new(HttpsScratch::new());
 
 struct SseScratch {
-    tcp_state: TcpClientState<1, 2048, 2048>,
+    tcp_state: TcpClientState<1, 1536, 1024>,
     tls_rx: [u8; TLS_RX_BUF_LEN],
-    tls_tx: [u8; TLS_TX_BUF_LEN],
-    http_rx: [u8; 1536],
-    line_buf: [u8; 1024],
-    data_buf: FixedBuf<1024>,
+    tls_tx: [u8; 2048],
+    http_rx: [u8; 1024],
+    line_buf: [u8; 768],
+    chunk_buf: [u8; 512],
+    data_buf: FixedBuf<768>,
     url_buf: FixedBuf<1792>,
 }
 
@@ -1543,9 +1768,10 @@ impl SseScratch {
         Self {
             tcp_state: TcpClientState::new(),
             tls_rx: [0u8; TLS_RX_BUF_LEN],
-            tls_tx: [0u8; TLS_TX_BUF_LEN],
-            http_rx: [0u8; 1536],
-            line_buf: [0u8; 1024],
+            tls_tx: [0u8; 2048],
+            http_rx: [0u8; 1024],
+            line_buf: [0u8; 768],
+            chunk_buf: [0u8; 512],
             data_buf: FixedBuf::new(),
             url_buf: FixedBuf::new(),
         }
@@ -1584,83 +1810,118 @@ fn current_unix_timestamp() -> Option<u64> {
     })
 }
 
-/// Executes an async HTTPS request using static TLS/TCP scratch buffers (zero large heap allocs)
-/// and passes `(status_code, response_body)` to `parse`.
-async fn https_request_with<R>(
-    stack: Stack<'static>,
-    seed: u64,
-    method: Method,
-    url: &str,
-    extra_headers: &[(&str, &str)],
-    content_type: Option<ContentType>,
-    body: Option<&[u8]>,
-    parse: impl FnOnce(u16, &[u8]) -> R,
-) -> Result<R, &'static str> {
-    let mut scratch = HTTPS_SCRATCH.lock().await;
-    let HttpsScratch {
-        tcp_state,
-        tls_rx,
-        tls_tx,
-        http_rx,
-    } = &mut *scratch;
+/// Single dedicated HTTPS worker task holding the `HttpClient::new_with_tls` async state machine
+/// so caller tasks (`auth_task`, `rtdb_state_reporter_task`, `rtdb_sse_listener_task`) keep tiny `.bss` pools.
+#[embassy_executor::task]
+async fn https_worker_task(stack: Stack<'static>, seed: u64) -> ! {
+    loop {
+        HTTPS_GO_SIGNAL.wait().await;
+        {
+            let mut scratch = HTTPS_SCRATCH.lock().await;
+            let HttpsScratch {
+                tcp_state,
+                tls_rx,
+                tls_tx,
+                http_rx,
+                url_buf,
+                req_buf,
+                job,
+            } = &mut *scratch;
 
-    let fut = async {
-        let tcp_client = TcpClient::new(stack, tcp_state);
-        let dns_socket = DnsSocket::new(stack);
-        let tls_config = TlsConfig::new(next_tls_seed(seed), tls_rx, tls_tx, TlsVerify::None);
-        let mut client = HttpClient::new_with_tls(&tcp_client, &dns_socket, tls_config);
+            let fut = async {
+                let tcp_client = TcpClient::new(stack, tcp_state);
+                let dns_socket = DnsSocket::new(stack);
+                let tls_config =
+                    TlsConfig::new(next_tls_seed(seed), tls_rx, tls_tx, TlsVerify::None);
+                let mut client = HttpClient::new_with_tls(&tcp_client, &dns_socket, tls_config);
 
-        let mut req = client
-            .request(method, url)
-            .await
-            .map_err(|_| "HTTP request init failed")?;
+                let mut req = client
+                    .request(job.method, url_buf.as_str())
+                    .await
+                    .map_err(|_| "HTTP request init failed")?;
 
-        if !extra_headers.is_empty() {
-            req = req.headers(extra_headers);
+                let esp_hdr = [("X-Esp-Auth-Token", ESP_AUTH_TOKEN)];
+                let form_hdr = [("Content-Type", "application/x-www-form-urlencoded")];
+                match job.extra_header {
+                    HttpsExtraHeader::None => {}
+                    HttpsExtraHeader::EspAuthToken => req = req.headers(&esp_hdr),
+                    HttpsExtraHeader::FormUrlEncoded => req = req.headers(&form_hdr),
+                }
+                if job.json_content_type {
+                    req = req.content_type(ContentType::ApplicationJson);
+                }
+
+                if job.has_body {
+                    let mut req = req.body(req_buf.as_bytes());
+                    let resp = req
+                        .send(http_rx)
+                        .await
+                        .map_err(|_| "HTTPS send failed")?;
+                    let status = resp.status.0;
+                    let resp_len = resp
+                        .body()
+                        .read_to_end()
+                        .await
+                        .map_err(|_| "HTTPS body read failed")?
+                        .len();
+                    Ok((status, resp_len))
+                } else {
+                    let resp = req
+                        .send(http_rx)
+                        .await
+                        .map_err(|_| "HTTPS send failed")?;
+                    let status = resp.status.0;
+                    let resp_len = resp
+                        .body()
+                        .read_to_end()
+                        .await
+                        .map_err(|_| "HTTPS body read failed")?
+                        .len();
+                    Ok((status, resp_len))
+                }
+            };
+
+            match with_timeout(Duration::from_secs(20), fut).await {
+                Ok(Ok((status, len))) => {
+                    job.status = status;
+                    job.resp_len = len;
+                    job.err = None;
+                }
+                Ok(Err(e)) => {
+                    job.status = 0;
+                    job.resp_len = 0;
+                    job.err = Some(e);
+                }
+                Err(_) => {
+                    job.status = 0;
+                    job.resp_len = 0;
+                    job.err = Some("HTTPS request timed out");
+                }
+            }
         }
-        if let Some(ct) = content_type {
-            req = req.content_type(ct);
-        }
-
-        if let Some(payload) = body {
-            let mut req = req.body(payload);
-            let resp = req
-                .send(http_rx)
-                .await
-                .map_err(|_| "HTTPS send failed")?;
-            let status = resp.status.0;
-            let resp_bytes = resp
-                .body()
-                .read_to_end()
-                .await
-                .map_err(|_| "HTTPS body read failed")?;
-            Ok(parse(status, resp_bytes))
-        } else {
-            let resp = req
-                .send(http_rx)
-                .await
-                .map_err(|_| "HTTPS send failed")?;
-            let status = resp.status.0;
-            let resp_bytes = resp
-                .body()
-                .read_to_end()
-                .await
-                .map_err(|_| "HTTPS body read failed")?;
-            Ok(parse(status, resp_bytes))
-        }
-    };
-
-    match with_timeout(Duration::from_secs(20), fut).await {
-        Ok(res) => res,
-        Err(_) => Err("HTTPS request timed out"),
+        HTTPS_DONE_SIGNAL.signal(());
     }
 }
 
-async fn read_id_token_copy() -> FixedBuf<MAX_ID_TOKEN_LEN> {
+/// Dispatches a prepared request in `HTTPS_SCRATCH` to `https_worker_task` (caller holds `HTTPS_CALL_LOCK`).
+async fn dispatch_https_job<R>(parse: impl FnOnce(u16, &[u8]) -> R) -> Result<R, &'static str> {
+    HTTPS_DONE_SIGNAL.reset();
+    HTTPS_GO_SIGNAL.signal(());
+    HTTPS_DONE_SIGNAL.wait().await;
+    let scratch = HTTPS_SCRATCH.lock().await;
+    if let Some(e) = scratch.job.err {
+        Err(e)
+    } else {
+        Ok(parse(
+            scratch.job.status,
+            &scratch.http_rx[..scratch.job.resp_len],
+        ))
+    }
+}
+
+async fn has_auth_id_token() -> bool {
     let auth = AUTH_STATE.lock().await;
-    let mut out = FixedBuf::new();
-    let _ = out.push_bytes(auth.id_token.as_bytes());
-    out
+    !auth.id_token.is_empty()
 }
 
 async fn set_auth_id_token(token: &str) -> bool {
@@ -1717,19 +1978,11 @@ struct RefreshTokenResp {
 /// Polls `verifyPairing` for up to 5 minutes until HTTP 200 with a `customToken` is received.
 async fn poll_verify_pairing(
     stack: Stack<'static>,
-    seed: u64,
     device_id: &str,
     esp_uid: &str,
 ) -> Option<String> {
     let window_start = Instant::now();
     let window_duration = Duration::from_secs(PAIRING_WINDOW_SECS);
-    let headers = [("X-Esp-Auth-Token", ESP_AUTH_TOKEN)];
-    let mut payload = FixedBuf::<256>::new();
-    let _ = write!(
-        payload,
-        r#"{{"deviceId":"{}","pin":"{}","espUid":"{}"}}"#,
-        device_id, FACTORY_PASSKEY, esp_uid
-    );
 
     println!(
         "PAIRING: 5-minute pairing window opened for {} (espUid={})",
@@ -1745,15 +1998,29 @@ async fn poll_verify_pairing(
         }
 
         println!("PAIRING: Sending verifyPairing POST to {}", CLOUD_FUNC_URL);
-        match https_request_with(
-            stack,
-            seed,
-            Method::POST,
-            CLOUD_FUNC_URL,
-            &headers,
-            Some(ContentType::ApplicationJson),
-            Some(payload.as_bytes()),
-            |status, body| {
+        let res = {
+            let _call = HTTPS_CALL_LOCK.lock().await;
+            {
+                let mut scratch = HTTPS_SCRATCH.lock().await;
+                scratch.url_buf.clear();
+                let _ = scratch.url_buf.write_str(CLOUD_FUNC_URL);
+                scratch.req_buf.clear();
+                let _ = write!(
+                    scratch.req_buf,
+                    r#"{{"deviceId":"{}","pin":"{}","espUid":"{}"}}"#,
+                    device_id, FACTORY_PASSKEY, esp_uid
+                );
+                scratch.job = HttpsJob {
+                    method: Method::POST,
+                    extra_header: HttpsExtraHeader::EspAuthToken,
+                    json_content_type: true,
+                    has_body: true,
+                    status: 0,
+                    resp_len: 0,
+                    err: None,
+                };
+            }
+            dispatch_https_job(|status, body| {
                 let token = if status == 200 {
                     serde_json::from_slice::<VerifyPairingResp>(body)
                         .ok()
@@ -1762,10 +2029,11 @@ async fn poll_verify_pairing(
                     None
                 };
                 (status, token)
-            },
-        )
-        .await
-        {
+            })
+            .await
+        };
+
+        match res {
             Ok((200, Some(ct))) if !ct.is_empty() => {
                 println!(
                     "PAIRING: Pairing successful (HTTP 200) for {}; received customToken.",
@@ -1810,33 +2078,51 @@ async fn poll_verify_pairing(
 }
 
 /// Exchanges a Firebase `customToken` for an `idToken` (RAM) and `refreshToken` (SLN3 NVS).
-async fn exchange_custom_token(stack: Stack<'static>, seed: u64, custom_token: &str) -> bool {
-    let mut url = FixedBuf::<256>::new();
-    let _ = write!(url, "{}{}", AUTH_CUSTOM_TOKEN_URL_BASE, FIREBASE_WEB_API_KEY);
-    let body = alloc::format!(
-        r#"{{"token":"{}","returnSecureToken":true}}"#,
-        custom_token
-    );
-
-    match https_request_with(
-        stack,
-        seed,
-        Method::POST,
-        url.as_str(),
-        &[],
-        Some(ContentType::ApplicationJson),
-        Some(body.as_bytes()),
-        |status, resp_body| {
-            let parsed = if status == 200 {
-                serde_json::from_slice::<CustomTokenExchangeResp>(resp_body).ok()
-            } else {
-                None
+async fn exchange_custom_token(custom_token: &str) -> bool {
+    let res = {
+        let _call = HTTPS_CALL_LOCK.lock().await;
+        let prep_ok = {
+            let mut scratch = HTTPS_SCRATCH.lock().await;
+            scratch.url_buf.clear();
+            let _ = write!(
+                scratch.url_buf,
+                "{}{}",
+                AUTH_CUSTOM_TOKEN_URL_BASE, FIREBASE_WEB_API_KEY
+            );
+            scratch.req_buf.clear();
+            let ok = write!(
+                scratch.req_buf,
+                r#"{{"token":"{}","returnSecureToken":true}}"#,
+                custom_token
+            )
+            .is_ok();
+            scratch.job = HttpsJob {
+                method: Method::POST,
+                extra_header: HttpsExtraHeader::None,
+                json_content_type: true,
+                has_body: true,
+                status: 0,
+                resp_len: 0,
+                err: None,
             };
-            (status, parsed)
-        },
-    )
-    .await
-    {
+            ok
+        };
+        if !prep_ok {
+            Err("Custom token request overflow")
+        } else {
+            dispatch_https_job(|status, resp_body| {
+                let parsed = if status == 200 {
+                    serde_json::from_slice::<CustomTokenExchangeResp>(resp_body).ok()
+                } else {
+                    None
+                };
+                (status, parsed)
+            })
+            .await
+        }
+    };
+
+    match res {
         Ok((200, Some(resp))) => {
             if let (Some(id_tok), Some(ref_tok)) = (resp.id_token, resp.refresh_token)
                 && !id_tok.is_empty()
@@ -1885,47 +2171,69 @@ enum RefreshOutcome {
 }
 
 /// Exchanges the NVS `refresh_token` for a fresh `id_token` (and updates rotated `refresh_token`).
-async fn refresh_id_token_via_nvs(
-    stack: Stack<'static>,
-    seed: u64,
-    refresh_token: &str,
-) -> RefreshOutcome {
-    let mut url = FixedBuf::<256>::new();
-    let _ = write!(url, "{}{}", AUTH_REFRESH_TOKEN_URL_BASE, FIREBASE_WEB_API_KEY);
-    let mut body = FixedBuf::<400>::new();
-    if write!(body, "grant_type=refresh_token&refresh_token={}", refresh_token).is_err() {
-        return RefreshOutcome::Revoked;
-    }
-    let headers = [("Content-Type", "application/x-www-form-urlencoded")];
+async fn refresh_id_token_via_nvs() -> RefreshOutcome {
+    let res = {
+        let _call = HTTPS_CALL_LOCK.lock().await;
+        let has_rt = {
+            let mut scratch = HTTPS_SCRATCH.lock().await;
+            scratch.url_buf.clear();
+            let _ = write!(
+                scratch.url_buf,
+                "{}{}",
+                AUTH_REFRESH_TOKEN_URL_BASE, FIREBASE_WEB_API_KEY
+            );
+            scratch.req_buf.clear();
+            let ok = nvs_read_with(|nvs| {
+                if let Some(rt) = nvs.refresh_token_str() {
+                    write!(scratch.req_buf, "grant_type=refresh_token&refresh_token={}", rt).is_ok()
+                } else {
+                    false
+                }
+            })
+            .await;
+            scratch.job = HttpsJob {
+                method: Method::POST,
+                extra_header: HttpsExtraHeader::FormUrlEncoded,
+                json_content_type: false,
+                has_body: true,
+                status: 0,
+                resp_len: 0,
+                err: None,
+            };
+            ok
+        };
 
-    match https_request_with(
-        stack,
-        seed,
-        Method::POST,
-        url.as_str(),
-        &headers,
-        None,
-        Some(body.as_bytes()),
-        |status, resp_body| {
+        if !has_rt {
+            return RefreshOutcome::Revoked;
+        }
+
+        dispatch_https_job(|status, resp_body| {
             let parsed = if status == 200 {
                 serde_json::from_slice::<RefreshTokenResp>(resp_body).ok()
             } else {
                 None
             };
             (status, parsed)
-        },
-    )
-    .await
-    {
+        })
+        .await
+    };
+
+    match res {
         Ok((200, Some(resp))) => {
             if let Some(id_tok) = resp.id_token
                 && !id_tok.is_empty()
             {
                 if let Some(new_rt) = resp.refresh_token
                     && !new_rt.is_empty()
-                    && new_rt != refresh_token
                 {
-                    let _ = nvs_update(|nvs| nvs.set_refresh_token(&new_rt)).await;
+                    let _ = nvs_update(|nvs| {
+                        if nvs.refresh_token_str() != Some(new_rt.as_str()) {
+                            nvs.set_refresh_token(&new_rt)
+                        } else {
+                            false
+                        }
+                    })
+                    .await;
                 }
                 if set_auth_id_token(&id_tok).await {
                     println!("AUTH: Refreshed id_token in RAM (valid 45m refresh cycle).");
@@ -1956,7 +2264,7 @@ async fn refresh_id_token_via_nvs(
 
 /// Manages pairing (`verifyPairing`), Custom Token exchange, and 45-min `id_token` refresh lifecycle.
 #[embassy_executor::task]
-async fn auth_task(stack: Stack<'static>, seed: u64) -> ! {
+async fn auth_task(stack: Stack<'static>) -> ! {
     stack.wait_config_up().await;
 
     let device_id = build_device_name();
@@ -1973,8 +2281,8 @@ async fn auth_task(stack: Stack<'static>, seed: u64) -> ! {
             println!("AUTH: Network restored; triggering immediate id_token refresh.");
         }
 
-        let nvs = nvs_load().await;
-        if let Some(rt) = nvs.refresh_token_str() {
+        let has_refresh_token = nvs_read_with(|nvs| nvs.refresh_token_len > 0).await;
+        if has_refresh_token {
             let (need_refresh, rtdb_errors) = {
                 let auth = AUTH_STATE.lock().await;
                 let expired = auth.id_token.is_empty()
@@ -2003,7 +2311,7 @@ async fn auth_task(stack: Stack<'static>, seed: u64) -> ! {
             }
 
             if need_refresh {
-                match refresh_id_token_via_nvs(stack, seed, rt).await {
+                match refresh_id_token_via_nvs().await {
                     RefreshOutcome::Ok => {
                         backoff_secs = 5;
                     }
@@ -2036,10 +2344,10 @@ async fn auth_task(stack: Stack<'static>, seed: u64) -> ! {
         } else {
             clear_auth_id_token().await;
             if let Some(custom_token) =
-                poll_verify_pairing(stack, seed, &device_id, &esp_uid).await
+                poll_verify_pairing(stack, &device_id, &esp_uid).await
             {
                 for attempt in 1..=3 {
-                    if exchange_custom_token(stack, seed, &custom_token).await {
+                    if exchange_custom_token(&custom_token).await {
                         break;
                     }
                     println!("AUTH: Custom token exchange attempt {}/3 failed; retrying...", attempt);
@@ -2118,13 +2426,7 @@ fn parse_cmd_update_from_sse(json_str: &str) -> Option<CmdUpdate> {
     Some(upd)
 }
 
-async fn apply_cmd_update(
-    stack: Stack<'static>,
-    seed: u64,
-    device_id: &str,
-    id_token: &str,
-    upd: CmdUpdate,
-) {
+async fn apply_cmd_update(device_id: &str, upd: CmdUpdate) {
     let new_cfg = {
         let mut state = DEVICE_STATE.lock().await;
         if let Some(lamp_on) = upd.lamp {
@@ -2188,23 +2490,43 @@ async fn apply_cmd_update(
 
     if upd.restart == Some(true) {
         println!("SSE: Remote restart requested! Clearing restart flag and rebooting...");
-        let mut patch_url = FixedBuf::<1792>::new();
-        let _ = write!(
-            patch_url,
-            "https://{}/live/{}/cmd.json?auth={}",
-            RTDB_HOST, device_id, id_token
-        );
-        let _ = https_request_with(
-            stack,
-            seed,
-            Method::PATCH,
-            patch_url.as_str(),
-            &[],
-            Some(ContentType::ApplicationJson),
-            Some(br#"{"restart":false}"#),
-            |status, _| status,
-        )
-        .await;
+        {
+            let _call = HTTPS_CALL_LOCK.lock().await;
+            let has_token = {
+                let mut scratch = HTTPS_SCRATCH.lock().await;
+                scratch.url_buf.clear();
+                let ok = {
+                    let auth = AUTH_STATE.lock().await;
+                    if auth.id_token.is_empty() {
+                        false
+                    } else {
+                        write!(
+                            scratch.url_buf,
+                            "https://{}/live/{}/cmd.json?auth={}",
+                            RTDB_HOST,
+                            device_id,
+                            auth.id_token.as_str()
+                        )
+                        .is_ok()
+                    }
+                };
+                scratch.req_buf.clear();
+                let _ = scratch.req_buf.write_str(r#"{"restart":false}"#);
+                scratch.job = HttpsJob {
+                    method: Method::PATCH,
+                    extra_header: HttpsExtraHeader::None,
+                    json_content_type: true,
+                    has_body: true,
+                    status: 0,
+                    resp_len: 0,
+                    err: None,
+                };
+                ok
+            };
+            if has_token {
+                let _ = dispatch_https_job(|status, _| status).await;
+            }
+        }
         Timer::after(Duration::from_millis(500)).await;
         esp_hal::system::software_reset();
     }
@@ -2223,8 +2545,7 @@ async fn rtdb_sse_listener_task(stack: Stack<'static>, seed: u64) -> ! {
         }
 
         SSE_WAKE_SIGNAL.reset();
-        let id_token = read_id_token_copy().await;
-        if id_token.is_empty() {
+        if !has_auth_id_token().await {
             let _ = select(
                 Timer::after(Duration::from_secs(5)),
                 SSE_WAKE_SIGNAL.wait(),
@@ -2250,179 +2571,190 @@ async fn rtdb_sse_listener_task(stack: Stack<'static>, seed: u64) -> ! {
                 tls_tx,
                 http_rx,
                 line_buf,
+                chunk_buf,
                 data_buf,
                 url_buf,
             } = &mut *scratch;
 
             url_buf.clear();
-            let _ = write!(
-                url_buf,
-                "https://{}/live/{}/cmd.json?auth={}",
-                RTDB_HOST,
-                device_id,
-                id_token.as_str()
-            );
+            let has_url = {
+                let auth = AUTH_STATE.lock().await;
+                if auth.id_token.is_empty() {
+                    false
+                } else {
+                    write!(
+                        url_buf,
+                        "https://{}/live/{}/cmd.json?auth={}",
+                        RTDB_HOST,
+                        device_id,
+                        auth.id_token.as_str()
+                    )
+                    .is_ok()
+                }
+            };
+            if !has_url {
+                SseStopReason::TokenRotated
+            } else {
+                let tcp_client = TcpClient::new(stack, tcp_state);
+                let dns_socket = DnsSocket::new(stack);
+                let tls_config =
+                    TlsConfig::new(next_tls_seed(seed), tls_rx, tls_tx, TlsVerify::None);
+                let mut client = HttpClient::new_with_tls(&tcp_client, &dns_socket, tls_config);
 
-            let tcp_client = TcpClient::new(stack, tcp_state);
-            let dns_socket = DnsSocket::new(stack);
-            let tls_config = TlsConfig::new(next_tls_seed(seed), tls_rx, tls_tx, TlsVerify::None);
-            let mut client = HttpClient::new_with_tls(&tcp_client, &dns_socket, tls_config);
+                let sse_headers = [("Accept", "text/event-stream"), ("Connection", "keep-alive")];
+                let req_res = with_timeout(
+                    Duration::from_secs(20),
+                    client.request(Method::GET, url_buf.as_str()),
+                )
+                .await;
 
-            let sse_headers = [("Accept", "text/event-stream"), ("Connection", "keep-alive")];
-            let req_res = with_timeout(
-                Duration::from_secs(20),
-                client.request(Method::GET, url_buf.as_str()),
-            )
-            .await;
+                match req_res {
+                    Ok(Ok(req_handle)) => {
+                        let mut req = req_handle.headers(&sse_headers);
+                        let send_res =
+                            with_timeout(Duration::from_secs(20), req.send(http_rx)).await;
+                        match send_res {
+                            Ok(Ok(resp)) => {
+                                let status = resp.status.0;
+                                if status == 401 || status == 403 {
+                                    println!("SSE: RTDB rejected connection with HTTP {}", status);
+                                    SseStopReason::AuthError
+                                } else if status != 200 {
+                                    println!("SSE: Unexpected HTTP status {}", status);
+                                    SseStopReason::Reconnect
+                                } else {
+                                    println!("SSE: Connected to /live/{}/cmd.json", device_id);
+                                    backoff_idx = 0;
+                                    mark_rtdb_ok().await;
 
-            match req_res {
-                Ok(Ok(req_handle)) => {
-                    let mut req = req_handle.headers(&sse_headers);
-                    let send_res = with_timeout(Duration::from_secs(20), req.send(http_rx)).await;
-                    match send_res {
-                        Ok(Ok(resp)) => {
-                            let status = resp.status.0;
-                            if status == 401 || status == 403 {
-                                println!("SSE: RTDB rejected connection with HTTP {}", status);
-                                SseStopReason::AuthError
-                            } else if status != 200 {
-                                println!("SSE: Unexpected HTTP status {}", status);
-                                SseStopReason::Reconnect
-                            } else {
-                                println!("SSE: Connected to /live/{}/cmd.json", device_id);
-                                backoff_idx = 0;
-                                mark_rtdb_ok().await;
+                                    let mut reader = resp.body().reader();
+                                    let mut line_len: usize = 0;
+                                    let mut line_overflow = false;
+                                    let mut current_event = FixedBuf::<32>::new();
+                                    data_buf.clear();
 
-                                let mut reader = resp.body().reader();
-                                let mut line_len: usize = 0;
-                                let mut line_overflow = false;
-                                let mut current_event = FixedBuf::<32>::new();
-                                data_buf.clear();
-                                let mut chunk = [0u8; 512];
+                                    loop {
+                                        let read_sel = select(
+                                            with_timeout(
+                                                Duration::from_secs(SSE_READ_TIMEOUT_SECS),
+                                                reader.read(chunk_buf),
+                                            ),
+                                            SSE_WAKE_SIGNAL.wait(),
+                                        )
+                                        .await;
 
-                                loop {
-                                    let read_sel = select(
-                                        with_timeout(
-                                            Duration::from_secs(SSE_READ_TIMEOUT_SECS),
-                                            reader.read(&mut chunk),
-                                        ),
-                                        SSE_WAKE_SIGNAL.wait(),
-                                    )
-                                    .await;
+                                        let n = match read_sel {
+                                            Either::Second(()) => {
+                                                println!("SSE: Woken for token update; reconnecting cleanly.");
+                                                break SseStopReason::TokenRotated;
+                                            }
+                                            Either::First(Err(_)) => {
+                                                println!("SSE: Stream read timed out; reconnecting...");
+                                                break SseStopReason::Reconnect;
+                                            }
+                                            Either::First(Ok(Err(_))) => {
+                                                println!("SSE: Stream read error; reconnecting...");
+                                                break SseStopReason::Reconnect;
+                                            }
+                                            Either::First(Ok(Ok(0))) => {
+                                                println!("SSE: Stream closed by server; reconnecting...");
+                                                break SseStopReason::Reconnect;
+                                            }
+                                            Either::First(Ok(Ok(n))) => n,
+                                        };
 
-                                    let n = match read_sel {
-                                        Either::Second(()) => {
-                                            println!("SSE: Woken for token update; reconnecting cleanly.");
-                                            break SseStopReason::TokenRotated;
-                                        }
-                                        Either::First(Err(_)) => {
-                                            println!("SSE: Stream read timed out; reconnecting...");
-                                            break SseStopReason::Reconnect;
-                                        }
-                                        Either::First(Ok(Err(_))) => {
-                                            println!("SSE: Stream read error; reconnecting...");
-                                            break SseStopReason::Reconnect;
-                                        }
-                                        Either::First(Ok(Ok(0))) => {
-                                            println!("SSE: Stream closed by server; reconnecting...");
-                                            break SseStopReason::Reconnect;
-                                        }
-                                        Either::First(Ok(Ok(n))) => n,
-                                    };
+                                        let mut frame_action: Option<SseStopReason> = None;
 
-                                    let mut frame_action: Option<SseStopReason> = None;
-
-                                    for &b in &chunk[..n] {
-                                        if b == b'\r' {
-                                            continue;
-                                        }
-                                        if b == b'\n' {
-                                            if line_overflow {
-                                                line_len = 0;
-                                                line_overflow = false;
-                                                current_event.clear();
-                                                data_buf.clear();
+                                        for &b in &chunk_buf[..n] {
+                                            if b == b'\r' {
                                                 continue;
                                             }
+                                            if b == b'\n' {
+                                                if line_overflow {
+                                                    line_len = 0;
+                                                    line_overflow = false;
+                                                    current_event.clear();
+                                                    data_buf.clear();
+                                                    continue;
+                                                }
 
-                                            let line =
-                                                core::str::from_utf8(&line_buf[..line_len]).unwrap_or("");
-                                            line_len = 0;
+                                                let line =
+                                                    core::str::from_utf8(&line_buf[..line_len])
+                                                        .unwrap_or("");
+                                                line_len = 0;
 
-                                            if line.is_empty() {
-                                                let ev = current_event.as_str();
-                                                if ev == "auth_revoked" || ev == "cancel" {
-                                                    println!("SSE: Received '{}' event.", ev);
-                                                    frame_action = Some(SseStopReason::AuthError);
-                                                    break;
-                                                } else if (ev == "put" || ev == "patch")
-                                                    && !data_buf.is_empty()
-                                                {
-                                                    if let Some(upd) =
-                                                        parse_cmd_update_from_sse(data_buf.as_str())
+                                                if line.is_empty() {
+                                                    let ev = current_event.as_str();
+                                                    if ev == "auth_revoked" || ev == "cancel" {
+                                                        println!("SSE: Received '{}' event.", ev);
+                                                        frame_action = Some(SseStopReason::AuthError);
+                                                        break;
+                                                    } else if (ev == "put" || ev == "patch")
+                                                        && !data_buf.is_empty()
                                                     {
-                                                        if upd.restart == Some(true) {
-                                                            pending_restart_upd = Some(upd);
-                                                            frame_action =
-                                                                Some(SseStopReason::ApplyRestart);
-                                                            break;
-                                                        } else {
-                                                            apply_cmd_update(
-                                                                stack,
-                                                                seed,
-                                                                &device_id,
-                                                                id_token.as_str(),
-                                                                upd,
+                                                        if let Some(upd) =
+                                                            parse_cmd_update_from_sse(
+                                                                data_buf.as_str(),
                                                             )
-                                                            .await;
+                                                        {
+                                                            if upd.restart == Some(true) {
+                                                                pending_restart_upd = Some(upd);
+                                                                frame_action = Some(
+                                                                    SseStopReason::ApplyRestart,
+                                                                );
+                                                                break;
+                                                            } else {
+                                                                apply_cmd_update(&device_id, upd)
+                                                                    .await;
+                                                            }
                                                         }
                                                     }
+                                                    current_event.clear();
+                                                    data_buf.clear();
+                                                } else if let Some(ev) = line.strip_prefix("event:") {
+                                                    current_event.clear();
+                                                    let _ = write!(current_event, "{}", ev.trim());
+                                                } else if let Some(d) = line.strip_prefix("data:") {
+                                                    let payload = d.strip_prefix(' ').unwrap_or(d);
+                                                    if !data_buf.is_empty() {
+                                                        let _ = data_buf.push_bytes(b"\n");
+                                                    }
+                                                    let _ = data_buf.push_bytes(payload.as_bytes());
                                                 }
-                                                current_event.clear();
-                                                data_buf.clear();
-                                            } else if let Some(ev) = line.strip_prefix("event:") {
-                                                current_event.clear();
-                                                let _ = write!(current_event, "{}", ev.trim());
-                                            } else if let Some(d) = line.strip_prefix("data:") {
-                                                let payload = d.strip_prefix(' ').unwrap_or(d);
-                                                if !data_buf.is_empty() {
-                                                    let _ = data_buf.push_bytes(b"\n");
+                                            } else if !line_overflow {
+                                                if line_len < line_buf.len() {
+                                                    line_buf[line_len] = b;
+                                                    line_len += 1;
+                                                } else {
+                                                    line_overflow = true;
                                                 }
-                                                let _ = data_buf.push_bytes(payload.as_bytes());
-                                            }
-                                        } else if !line_overflow {
-                                            if line_len < line_buf.len() {
-                                                line_buf[line_len] = b;
-                                                line_len += 1;
-                                            } else {
-                                                line_overflow = true;
                                             }
                                         }
-                                    }
 
-                                    if let Some(action) = frame_action {
-                                        break action;
+                                        if let Some(action) = frame_action {
+                                            break action;
+                                        }
                                     }
                                 }
                             }
-                        }
-                        Ok(Err(_)) => {
-                            println!("SSE: HTTP send failed; reconnecting...");
-                            SseStopReason::Reconnect
-                        }
-                        Err(_) => {
-                            println!("SSE: HTTP send timed out; reconnecting...");
-                            SseStopReason::Reconnect
+                            Ok(Err(_)) => {
+                                println!("SSE: HTTP send failed; reconnecting...");
+                                SseStopReason::Reconnect
+                            }
+                            Err(_) => {
+                                println!("SSE: HTTP send timed out; reconnecting...");
+                                SseStopReason::Reconnect
+                            }
                         }
                     }
-                }
-                Ok(Err(_)) => {
-                    println!("SSE: TCP/TLS connect failed; reconnecting...");
-                    SseStopReason::Reconnect
-                }
-                Err(_) => {
-                    println!("SSE: Connect/handshake timed out; reconnecting...");
-                    SseStopReason::Reconnect
+                    Ok(Err(_)) => {
+                        println!("SSE: TCP/TLS connect failed; reconnecting...");
+                        SseStopReason::Reconnect
+                    }
+                    Err(_) => {
+                        println!("SSE: Connect/handshake timed out; reconnecting...");
+                        SseStopReason::Reconnect
+                    }
                 }
             }
         };
@@ -2431,7 +2763,7 @@ async fn rtdb_sse_listener_task(stack: Stack<'static>, seed: u64) -> ! {
         match stop_reason {
             SseStopReason::ApplyRestart => {
                 if let Some(upd) = pending_restart_upd.take() {
-                    apply_cmd_update(stack, seed, &device_id, id_token.as_str(), upd).await;
+                    apply_cmd_update(&device_id, upd).await;
                 }
             }
             SseStopReason::TokenRotated => {
@@ -2463,7 +2795,7 @@ async fn rtdb_sse_listener_task(stack: Stack<'static>, seed: u64) -> ! {
 
 /// Reports device state & energy delta (`PATCH /live/<deviceId>/state.json`) on state changes or 20s heartbeat.
 #[embassy_executor::task]
-async fn rtdb_state_reporter_task(stack: Stack<'static>, seed: u64) -> ! {
+async fn rtdb_state_reporter_task(stack: Stack<'static>) -> ! {
     let device_id = build_device_name();
 
     loop {
@@ -2471,8 +2803,7 @@ async fn rtdb_state_reporter_task(stack: Stack<'static>, seed: u64) -> ! {
             stack.wait_config_up().await;
         }
 
-        let id_token = read_id_token_copy().await;
-        if id_token.is_empty() {
+        if !has_auth_id_token().await {
             let _ = select(
                 Timer::after(Duration::from_secs(5)),
                 REPORTER_STATE_SIGNAL.wait(),
@@ -2493,33 +2824,51 @@ async fn rtdb_state_reporter_task(stack: Stack<'static>, seed: u64) -> ! {
             )
         };
 
-        let mut url = FixedBuf::<1792>::new();
-        let _ = write!(
-            url,
-            "https://{}/live/{}/state.json?auth={}",
-            RTDB_HOST,
-            device_id,
-            id_token.as_str()
-        );
-        let mut payload = FixedBuf::<256>::new();
-        let _ = write!(
-            payload,
-            r#"{{"on":{},"auto":{},"lux":{},"mot":{},"ts":{{".sv":"timestamp"}},"energy_delta_sec":{},"p1_off":{}}}"#,
-            lamp_on, auto_on, lux, mot, energy_delta, p1_off
-        );
+        let patch_res = {
+            let _call = HTTPS_CALL_LOCK.lock().await;
+            let has_url = {
+                let mut scratch = HTTPS_SCRATCH.lock().await;
+                scratch.url_buf.clear();
+                let ok = {
+                    let auth = AUTH_STATE.lock().await;
+                    if auth.id_token.is_empty() {
+                        false
+                    } else {
+                        write!(
+                            scratch.url_buf,
+                            "https://{}/live/{}/state.json?auth={}",
+                            RTDB_HOST,
+                            device_id,
+                            auth.id_token.as_str()
+                        )
+                        .is_ok()
+                    }
+                };
+                scratch.req_buf.clear();
+                let _ = write!(
+                    scratch.req_buf,
+                    r#"{{"on":{},"auto":{},"lux":{},"mot":{},"ts":{{".sv":"timestamp"}},"energy_delta_sec":{},"p1_off":{}}}"#,
+                    lamp_on, auto_on, lux, mot, energy_delta, p1_off
+                );
+                scratch.job = HttpsJob {
+                    method: Method::PATCH,
+                    extra_header: HttpsExtraHeader::None,
+                    json_content_type: true,
+                    has_body: true,
+                    status: 0,
+                    resp_len: 0,
+                    err: None,
+                };
+                ok
+            };
+            if !has_url {
+                Ok(401u16)
+            } else {
+                dispatch_https_job(|status, _| status).await
+            }
+        };
 
-        match https_request_with(
-            stack,
-            seed,
-            Method::PATCH,
-            url.as_str(),
-            &[],
-            Some(ContentType::ApplicationJson),
-            Some(payload.as_bytes()),
-            |status, _| status,
-        )
-        .await
-        {
+        match patch_res {
             Ok(200) => {
                 mark_rtdb_ok().await;
                 let mut remaining_energy = false;
@@ -3162,35 +3511,32 @@ async fn run_captive_portal(
         scanned_ssids.len()
     );
 
-    let latest_nvs = nvs_load().await;
-    let saved_ssid_visible = latest_nvs
-        .wifi
+    let (cfg_is_configured, saved_wifi_ssid) =
+        nvs_read_with(|nvs| (nvs.config.is_configured(), nvs.wifi.as_ref().map(|w| w.ssid.clone())))
+            .await;
+    let saved_ssid_visible = saved_wifi_ssid
         .as_ref()
-        .is_some_and(|w| scanned_ssids.iter().any(|s| s == &w.ssid));
+        .is_some_and(|ssid| scanned_ssids.iter().any(|s| s == ssid));
 
     let timeout = if allow_auto_countdown
         && !*last_wifi_error
-        && latest_nvs.config.is_configured()
+        && cfg_is_configured
         && saved_ssid_visible
     {
         println!(
             "Scan-Before-Countdown: saved SSID '{}' reachable -> starting {}s AP countdown.",
-            latest_nvs
-                .wifi
-                .as_ref()
-                .map(|w| w.ssid.as_str())
-                .unwrap_or(""),
+            saved_wifi_ssid.as_deref().unwrap_or(""),
             AP_BOOT_WINDOW_SECS
         );
         Some(Duration::from_secs(AP_BOOT_WINDOW_SECS))
     } else {
-        if latest_nvs.config.is_configured()
-            && let Some(ref w) = latest_nvs.wifi
+        if cfg_is_configured
+            && let Some(ref ssid) = saved_wifi_ssid
             && !saved_ssid_visible
         {
             println!(
                 "Scan-Before-Countdown: saved SSID '{}' NOT reachable -> limitless AP (no auto-connect).",
-                w.ssid
+                ssid
             );
         } else {
             println!("AP mode: limitless (no auto-countdown).");
@@ -3235,7 +3581,7 @@ async fn run_captive_portal(
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
-    esp_alloc::heap_allocator!(size: 80 * 1024);
+    esp_alloc::heap_allocator!(size: 128 * 1024);
 
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
@@ -3244,16 +3590,16 @@ async fn main(spawner: Spawner) {
 
     let flash = FlashStorage::new(peripherals.FLASH);
     {
-        let mut guard = NVS_FLASH.lock().await;
-        *guard = Some(flash);
+        let mut nvs_state = NVS_FLASH.lock().await;
+        nvs_state.flash = Some(flash);
     }
-    let nvs_data = nvs_load().await;
+    let (boot_cfg, has_saved_wifi) = nvs_read_with(|d| (d.config, d.wifi.is_some())).await;
     {
         let mut state = DEVICE_STATE.lock().await;
-        state.threshold = nvs_data.config.threshold;
-        state.sensitivity = nvs_data.config.sensitivity;
-        state.duration = nvs_data.config.duration;
-        state.safety_off_min = nvs_data.config.safety_off_min;
+        state.threshold = boot_cfg.threshold;
+        state.sensitivity = boot_cfg.sensitivity;
+        state.duration = boot_cfg.duration;
+        state.safety_off_min = boot_cfg.safety_off_min;
     }
 
     // Hardware Safety: do not drive physical relay/sensor GPIO pins yet; only WS2812 mirrors lamp_is_on.
@@ -3282,17 +3628,16 @@ async fn main(spawner: Spawner) {
     );
     spawner.spawn(net_task(sta_runner).expect("net_task spawn"));
     spawner.spawn(ntp_task(sta_stack).expect("ntp_task spawn"));
-    spawner.spawn(auth_task(sta_stack, seed).expect("auth_task spawn"));
+    spawner.spawn(https_worker_task(sta_stack, seed).expect("https_worker_task spawn"));
+    spawner.spawn(auth_task(sta_stack).expect("auth_task spawn"));
     spawner.spawn(rtdb_sse_listener_task(sta_stack, seed).expect("rtdb_sse_listener_task spawn"));
-    spawner.spawn(
-        rtdb_state_reporter_task(sta_stack, seed).expect("rtdb_state_reporter_task spawn"),
-    );
+    spawner.spawn(rtdb_state_reporter_task(sta_stack).expect("rtdb_state_reporter_task spawn"));
 
-    if nvs_data.config.is_configured() && nvs_data.wifi.is_some() {
+    if boot_cfg.is_configured() && has_saved_wifi {
         println!(
             "BOOT Case 3 (Configured + Saved Wi-Fi): Checking saved SSID reachability via initial scan..."
         );
-    } else if !nvs_data.config.is_configured() {
+    } else if !boot_cfg.is_configured() {
         println!("BOOT Case 1 (Virgin / Unconfigured): P3 automation inactive (P2 manual active); starting limitless AP.");
     } else {
         println!("BOOT Case 2 (Configured, no Wi-Fi): Automation active; starting limitless AP.");
@@ -3344,8 +3689,8 @@ async fn main(spawner: Spawner) {
                 }
             }
             PortalOutcome::TimeoutExpired => {
-                let latest_nvs = nvs_load().await;
-                if let Some(saved_creds) = latest_nvs.wifi {
+                let saved_wifi = nvs_read_with(|d| d.wifi.clone()).await;
+                if let Some(saved_creds) = saved_wifi {
                     println!("300s AP window expired; connecting to saved Wi-Fi...");
                     if connect_sta_with_timeout(sta_stack, &mut controller, &saved_creds).await {
                         sta_online_keepalive(sta_stack, &mut controller).await;
