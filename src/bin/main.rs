@@ -71,18 +71,17 @@ const NVS_LEGACY_MAGIC: [u8; 4] = *b"SLN2";
 const NVS_LEGACY_VERSION: u8 = 3;
 const NVS_LEGACY_RECORD_LEN: usize = 128;
 const NVS_MAGIC: [u8; 4] = *b"SLN3";
-const NVS_VERSION: u8 = 4;
+const NVS_V4_VERSION: u8 = 4;
+const NVS_VERSION: u8 = 5;
 const NVS_RECORD_LEN: usize = 512;
 const MAX_REFRESH_TOKEN_LEN: usize = 320;
 
 const FACTORY_PASSKEY: &str = "K7M9P2X4R8";
 const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
 const AP_BOOT_WINDOW_SECS: u64 = 120;
-const PAIRING_WINDOW_SECS: u64 = 300;
-const PAIRING_RETRY_INTERVAL_SECS: u64 = 10;
 const MAX_POST_BODY_BYTES: usize = 512;
 const KEEPALIVE_INTERVAL_SECS: u64 = 15;
-const CLOUD_FUNC_URL: &str = "https://verifypairing-lfmgd4eena-uc.a.run.app";
+const VERIFY_PAIRING_URL: &str = "https://verifypairing-lfmgd4eena-uc.a.run.app";
 const ESP_AUTH_TOKEN: &str = "ESP32_SECRET_TOKEN_998877";
 const FIREBASE_WEB_API_KEY: &str = "AIzaSyCymXk2RyRcQ3Rn5JSvJvJeQIMAxH0KyQU";
 const RTDB_HOST: &str = "okospilacsvezerlo-default-rtdb.europe-west1.firebasedatabase.app";
@@ -180,6 +179,7 @@ struct DeviceConfig {
     sensitivity: u8,
     duration: u64,
     safety_off_min: u16,
+    lamp_wattage_w: u16,
 }
 
 impl DeviceConfig {
@@ -218,6 +218,7 @@ impl NvsData {
                 sensitivity: 0,
                 duration: 0,
                 safety_off_min: 0,
+                lamp_wattage_w: 0,
             },
             wifi: None,
             refresh_token: [0u8; MAX_REFRESH_TOKEN_LEN],
@@ -343,6 +344,11 @@ fn resolve_nvs_offset(state: &mut NvsStorageState) -> u32 {
 
 /// Parses config and Wi-Fi credentials from the shared header bytes (bytes 5..124).
 fn parse_nvs_config_and_wifi(buf: &[u8]) -> (DeviceConfig, Option<WifiCredentials>) {
+    let lamp_wattage_w = if buf[0..4] == NVS_MAGIC && buf[4] >= NVS_VERSION {
+        u16::from_le_bytes([buf[23], buf[24]]).min(5000)
+    } else {
+        0
+    };
     let config = DeviceConfig {
         threshold: u16::from_le_bytes([buf[8], buf[9]]),
         duration: u64::from_le_bytes([
@@ -350,6 +356,7 @@ fn parse_nvs_config_and_wifi(buf: &[u8]) -> (DeviceConfig, Option<WifiCredential
         ]),
         sensitivity: buf[18],
         safety_off_min: u16::from_le_bytes([buf[19], buf[20]]),
+        lamp_wattage_w,
     };
 
     let has_wifi = buf[5] == 1;
@@ -400,7 +407,8 @@ fn load_nvs_data(state: &mut NvsStorageState) {
 
     let buf = &state.sector_buf.0[in_sector..in_sector + NVS_RECORD_LEN];
 
-    if buf[0..4] == NVS_MAGIC && buf[4] == NVS_VERSION {
+    if buf[0..4] == NVS_MAGIC && (buf[4] == NVS_VERSION || buf[4] == NVS_V4_VERSION) {
+        let record_version = buf[4];
         let expected_crc = u32::from_le_bytes([buf[508], buf[509], buf[510], buf[511]]);
         if crc32(&buf[0..508]) != expected_crc {
             return;
@@ -413,6 +421,9 @@ fn load_nvs_data(state: &mut NvsStorageState) {
             && let Ok(rt_str) = core::str::from_utf8(&buf[124..124 + rt_len as usize])
         {
             let _ = state.scratch_nvs.set_refresh_token(rt_str);
+        }
+        if record_version == NVS_V4_VERSION && save_nvs_data(state).is_ok() {
+            println!("NVS: Migrated SLN3 v4 -> v5 (lamp_wattage_w=0).");
         }
         return;
     }
@@ -474,6 +485,7 @@ fn save_nvs_data(state: &mut NvsStorageState) -> Result<(), ()> {
         buf[18] = state.scratch_nvs.config.sensitivity;
         buf[19..21].copy_from_slice(&state.scratch_nvs.config.safety_off_min.to_le_bytes());
         buf[21..23].copy_from_slice(&state.scratch_nvs.refresh_token_len.to_le_bytes());
+        buf[23..25].copy_from_slice(&state.scratch_nvs.config.lamp_wattage_w.to_le_bytes());
 
         if let Some(creds) = &state.scratch_nvs.wifi {
             let ssid_bytes = creds.ssid.as_bytes();
@@ -708,6 +720,8 @@ struct ConfigSubmitPayload {
     sensitivity: u8,
     duration: u64,
     safety_off_min: u16,
+    #[serde(default)]
+    lamp_wattage_w: i32,
 }
 
 #[derive(Serialize)]
@@ -724,6 +738,7 @@ struct PortalStatusJson<'a> {
     sensitivity: u8,
     duration: u64,
     safety_off_min: u16,
+    lamp_wattage_w: u16,
 }
 
 enum PortalOutcome {
@@ -775,7 +790,7 @@ fn parse_wifi_submit(body: &str) -> Option<WifiCredentials> {
     })
 }
 
-/// Parses the 4 configuration parameters from JSON or URL-encoded form body and validates ranges.
+/// Parses the configuration parameters from JSON or URL-encoded form body and validates ranges.
 fn parse_config_submit(body: &str) -> Option<DeviceConfig> {
     let trimmed = body.trim();
     let cfg = if trimmed.starts_with('{') {
@@ -785,12 +800,14 @@ fn parse_config_submit(body: &str) -> Option<DeviceConfig> {
             sensitivity: parsed.sensitivity,
             duration: parsed.duration,
             safety_off_min: parsed.safety_off_min,
+            lamp_wattage_w: parsed.lamp_wattage_w.clamp(0, 5000) as u16,
         }
     } else {
         let mut threshold = None;
         let mut sensitivity = None;
         let mut duration = None;
         let mut safety_off_min = None;
+        let mut lamp_wattage_w = 0u16;
         for pair in trimmed.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
                 let val = url_decode(v);
@@ -799,6 +816,11 @@ fn parse_config_submit(body: &str) -> Option<DeviceConfig> {
                     "sensitivity" => sensitivity = val.trim().parse::<u8>().ok(),
                     "duration" => duration = val.trim().parse::<u64>().ok(),
                     "safety_off_min" => safety_off_min = val.trim().parse::<u16>().ok(),
+                    "lamp_wattage_w" => {
+                        if let Ok(w) = val.trim().parse::<i32>() {
+                            lamp_wattage_w = w.clamp(0, 5000) as u16;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -808,6 +830,7 @@ fn parse_config_submit(body: &str) -> Option<DeviceConfig> {
             sensitivity: sensitivity?,
             duration: duration?,
             safety_off_min: safety_off_min?,
+            lamp_wattage_w,
         }
     };
 
@@ -859,10 +882,16 @@ async fn send_portal_html_chunked(
     lamp_is_on: bool,
 ) {
     let safe_dev = html_escape(device_name);
-    let (pre_th, pre_se, pre_du, pre_so) = if cfg.is_configured() {
-        (cfg.threshold, cfg.sensitivity, cfg.duration, cfg.safety_off_min)
+    let (pre_th, pre_se, pre_du, pre_so, pre_lw) = if cfg.is_configured() {
+        (
+            cfg.threshold,
+            cfg.sensitivity,
+            cfg.duration,
+            cfg.safety_off_min,
+            cfg.lamp_wattage_w,
+        )
     } else {
-        (50, 50, 60, 0)
+        (50, 50, 60, 0, cfg.lamp_wattage_w)
     };
 
     let _ = socket
@@ -927,8 +956,8 @@ async fn send_portal_html_chunked(
           .sys-sec{border-top:1px solid #334155;padding-top:8px;display:flex;flex-direction:column;gap:6px;flex-shrink:0}\
           .sys-lbl{font-size:13px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.03em}\
           .cfg-card{margin:auto 0;border:1px solid #334155;border-radius:12px;background:#1e293b;\
-          padding:16px;display:flex;flex-direction:column;gap:12px;flex-shrink:0}\
-          .cfg-form{display:flex;flex-direction:column;gap:12px;flex-shrink:0}\
+          padding:12px 14px;display:flex;flex-direction:column;gap:10px;flex-shrink:0}\
+          .cfg-form{display:flex;flex-direction:column;gap:10px;flex-shrink:0}\
           .param-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-shrink:0}",
     )
     .await;
@@ -938,7 +967,7 @@ async fn send_portal_html_chunked(
         b".param-row label{font-size:15px;font-weight:600;color:#e2e8f0;text-align:left;flex:1}\
           .param-inp{width:88px;min-width:88px;max-width:88px;text-align:center;height:42px;padding:0 6px;\
           font-size:16px;font-weight:700;background:#0f172a;border:1px solid #475569}\
-          .hint{font-size:13px;color:#94a3b8;line-height:1.35;min-height:36px}\
+          .hint{font-size:12px;color:#94a3b8;line-height:1.3}\
           .modal-bg{position:fixed;inset:0;background:rgba(2,6,23,.78);display:flex;align-items:center;\
           justify-content:center;padding:14px;z-index:50}\
           .modal-card{width:100%;max-width:440px;background:#1e293b;border:1px solid #475569;\
@@ -1082,13 +1111,22 @@ async fn send_portal_html_chunked(
 
     write_http_chunk(
         socket,
-        "<div class='hint'>Manuális lámpa kapcsolás biztonsági kikapcsolási időzítője. Hagyd nullán, hogy soha ne kapcsolja le!</div>\
-          <button type='submit' id='saveCfgBtn'>Beállítások mentése</button>\
-          </form></div>\
-          <button type='button' class='btn-sec' onclick=\"showView('main')\">Vissza a Wi-Fi beállításokhoz</button>\
-          </div>".as_bytes(),
+        "<div class='hint'>Manuális lámpa kapcsolás biztonsági kikapcsolási időzítője. Hagyd nullán, hogy soha ne kapcsolja le!</div>".as_bytes(),
     )
     .await;
+
+    chunk.clear();
+    let _ = write!(
+        chunk,
+        "<div class='param-row'><label for='lamp_wattage_w'>Lámpa teljesítménye (W)</label><input type='number' id='lamp_wattage_w' name='lamp_wattage_w' class='param-inp' min='0' max='5000' step='1' placeholder='0' value='{lw}'></div>\
+         <div class='hint'>0 = fogyasztásmérés kikapcsolva</div>\
+         <button type='submit' id='saveCfgBtn'>Beállítások mentése</button>\
+         </form></div>\
+         <button type='button' class='btn-sec' onclick=\"showView('main')\">Vissza a Wi-Fi beállításokhoz</button>\
+         </div>",
+        lw = pre_lw,
+    );
+    write_http_chunk(socket, chunk.as_bytes()).await;
 
     write_http_chunk(
         socket,
@@ -1181,8 +1219,10 @@ async fn send_portal_html_chunked(
 
     write_http_chunk(
         socket,
-        "setInterval(async()=>{try{const r=await fetch('/status');if(!r.ok)return;const d=await r.json();\
-          updateLampUi(d.lamp_is_on);if(!connectingNow){wifiErr=!!d.wifi_error;remSecs=(typeof d.remaining_secs==='number')?d.remaining_secs:null;renderRow9();}}catch(_){}},5000);\
+        "async function syncStatus(init){try{const r=await fetch('/status');if(!r.ok)return;const d=await r.json();\
+          updateLampUi(d.lamp_is_on);if(init&&typeof d.lamp_wattage_w==='number'){const lwEl=document.getElementById('lamp_wattage_w');if(lwEl&&document.activeElement!==lwEl)lwEl.value=d.lamp_wattage_w;}\
+          if(!connectingNow){wifiErr=!!d.wifi_error;remSecs=(typeof d.remaining_secs==='number')?d.remaining_secs:null;renderRow9();}}catch(_){}}\
+          syncStatus(true);setInterval(()=>syncStatus(false),5000);\
           async function connectSavedNow(){const btn=document.getElementById('connectNowBtn');if(!btn||connectingNow)return;\
           btn.disabled=true;connectingNow=true;renderRow9();\
           try{const r=await fetch('/connect-saved',{method:'POST'});if(!r.ok){connectingNow=false;renderRow9();}}catch(_){}}\
@@ -1213,8 +1253,10 @@ async fn send_portal_html_chunked(
           async function toggleLamp(){try{const r=await fetch('/toggle-lamp',{method:'POST'});const d=await r.json();\
           if(d.ok)updateLampUi(d.lamp_is_on);}catch(_){}}\
           async function saveConfig(e){e.preventDefault();const btn=document.getElementById('saveCfgBtn');\
+          const lwEl=document.getElementById('lamp_wattage_w'),rawLw=Number(lwEl.value);\
+          const lw=Number.isFinite(rawLw)?Math.min(5000,Math.max(0,Math.round(rawLw))):0;lwEl.value=lw;\
           const payload={threshold:+document.getElementById('threshold').value,sensitivity:+document.getElementById('sensitivity').value,\
-          duration:+document.getElementById('duration').value,safety_off_min:+document.getElementById('safety_off_min').value};\
+          duration:+document.getElementById('duration').value,safety_off_min:+document.getElementById('safety_off_min').value,lamp_wattage_w:lw};\
           if(payload.threshold<1||payload.threshold>100||payload.sensitivity<1||payload.sensitivity>100||\
           payload.duration<10||payload.duration>600||payload.safety_off_min<0||payload.safety_off_min>1440){\
           btn.textContent='Érvénytelen értékek!';setTimeout(()=>{btn.textContent='Beállítások mentése';},1500);return;}\
@@ -1395,6 +1437,7 @@ async fn http_portal_server(
                         sensitivity: state.sensitivity,
                         duration: state.duration,
                         safety_off_min: state.safety_off_min,
+                        lamp_wattage_w: state.lamp_wattage_w,
                     };
                     drop(state);
                     let json = serde_json::to_string(&status).unwrap_or_else(|_| String::from("{}"));
@@ -1462,12 +1505,7 @@ async fn http_portal_server(
                 ("POST", "/clear-wifi") => {
                     let cur_cfg = {
                         let state = DEVICE_STATE.lock().await;
-                        DeviceConfig {
-                            threshold: state.threshold,
-                            sensitivity: state.sensitivity,
-                            duration: state.duration,
-                            safety_off_min: state.safety_off_min,
-                        }
+                        state.to_config()
                     };
                     let _ = nvs_update(|nvs| {
                         nvs.config = cur_cfg;
@@ -1524,16 +1562,12 @@ async fn http_portal_server(
                     if let Some(new_cfg) = parse_config_submit(body) {
                         let changed = {
                             let mut state = DEVICE_STATE.lock().await;
-                            let prev = DeviceConfig {
-                                threshold: state.threshold,
-                                sensitivity: state.sensitivity,
-                                duration: state.duration,
-                                safety_off_min: state.safety_off_min,
-                            };
+                            let prev = state.to_config();
                             state.threshold = new_cfg.threshold;
                             state.sensitivity = new_cfg.sensitivity;
                             state.duration = new_cfg.duration;
                             state.safety_off_min = new_cfg.safety_off_min;
+                            state.lamp_wattage_w = new_cfg.lamp_wattage_w;
                             prev != new_cfg
                         };
                         if changed {
@@ -1543,8 +1577,8 @@ async fn http_portal_server(
                             })
                             .await;
                             println!(
-                                "PORTAL: Config updated and saved to NVS (threshold={}, sensitivity={}, duration={}s, safety_off_min={}m).",
-                                new_cfg.threshold, new_cfg.sensitivity, new_cfg.duration, new_cfg.safety_off_min
+                                "PORTAL: Config updated and saved to NVS (threshold={}, sensitivity={}, duration={}s, safety_off_min={}m, lamp_wattage_w={}W).",
+                                new_cfg.threshold, new_cfg.sensitivity, new_cfg.duration, new_cfg.safety_off_min, new_cfg.lamp_wattage_w
                             );
                         } else {
                             println!("PORTAL: Config unchanged; skipped NVS write.");
@@ -1578,15 +1612,7 @@ async fn http_portal_server(
                     };
                     let (cfg, lamp_is_on) = {
                         let state = DEVICE_STATE.lock().await;
-                        (
-                            DeviceConfig {
-                                threshold: state.threshold,
-                                sensitivity: state.sensitivity,
-                                duration: state.duration,
-                                safety_off_min: state.safety_off_min,
-                            },
-                            state.lamp_is_on,
-                        )
+                        (state.to_config(), state.lamp_is_on)
                     };
                     let initial_view = if path == "/config" { "config" } else { "main" };
                     send_portal_html_chunked(
@@ -1669,6 +1695,7 @@ struct DeviceState {
     sensitivity: u8,
     duration: u64,
     safety_off_min: u16,
+    lamp_wattage_w: u16,
     remote_lamp_on: bool,
     lamp_is_on: bool,
     lamp_on_source: LampOnSource,
@@ -1691,6 +1718,16 @@ impl DeviceState {
             && (10..=600).contains(&self.duration)
             && self.safety_off_min <= 1440
     }
+
+    fn to_config(&self) -> DeviceConfig {
+        DeviceConfig {
+            threshold: self.threshold,
+            sensitivity: self.sensitivity,
+            duration: self.duration,
+            safety_off_min: self.safety_off_min,
+            lamp_wattage_w: self.lamp_wattage_w,
+        }
+    }
 }
 
 static DEVICE_STATE: EmbassyMutex<CriticalSectionRawMutex, DeviceState> =
@@ -1699,6 +1736,7 @@ static DEVICE_STATE: EmbassyMutex<CriticalSectionRawMutex, DeviceState> =
         sensitivity: 0,
         duration: 0,
         safety_off_min: 0,
+        lamp_wattage_w: 0,
         remote_lamp_on: false,
         lamp_is_on: false,
         lamp_on_source: LampOnSource::None,
@@ -1755,6 +1793,7 @@ struct HttpsJob {
     extra_header: HttpsExtraHeader,
     json_content_type: bool,
     has_body: bool,
+    timeout_ms: u32,
     status: u16,
     resp_len: usize,
     err: Option<&'static str>,
@@ -1767,6 +1806,7 @@ impl HttpsJob {
             extra_header: HttpsExtraHeader::None,
             json_content_type: false,
             has_body: false,
+            timeout_ms: 20_000,
             status: 0,
             resp_len: 0,
             err: None,
@@ -1933,7 +1973,12 @@ async fn https_worker_task(stack: Stack<'static>, seed: u64) -> ! {
                 }
             };
 
-            match with_timeout(Duration::from_secs(20), fut).await {
+            let timeout = Duration::from_millis(if job.timeout_ms > 0 {
+                job.timeout_ms as u64
+            } else {
+                20_000
+            });
+            match with_timeout(timeout, fut).await {
                 Ok(Ok((status, len))) => {
                     job.status = status;
                     job.resp_len = len;
@@ -2027,106 +2072,114 @@ struct RefreshTokenResp {
     refresh_token: Option<String>,
 }
 
-/// Polls `verifyPairing` for up to 5 minutes until HTTP 200 with a `customToken` is received.
-async fn poll_verify_pairing(
+#[derive(Deserialize)]
+struct FirebaseErrDetail {
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FirebaseErrResp {
+    error: Option<FirebaseErrDetail>,
+}
+
+fn is_revoked_refresh_error(msg: &str) -> bool {
+    msg.contains("USER_NOT_FOUND")
+        || msg.contains("INVALID_REFRESH_TOKEN")
+        || msg.contains("TOKEN_EXPIRED")
+        || msg.contains("USER_DISABLED")
+}
+
+/// Clears runtime `id_token` and NVS `refresh_token` while preserving Wi-Fi credentials and
+/// sensor/wattage configuration so `auth_task` can re-run Zero-Touch registration.
+async fn clear_auth_for_reregistration(reason: &str) {
+    println!(
+        "AUTH: {} -> clearing refresh_token/id_token for Zero-Touch re-registration.",
+        reason
+    );
+    clear_auth_id_token().await;
+    let _ = nvs_update(|nvs| {
+        let had_rt = nvs.refresh_token_len > 0 || nvs.refresh_token.iter().any(|&b| b != 0);
+        nvs.clear_refresh_token();
+        had_rt
+    })
+    .await;
+    {
+        let mut auth = AUTH_STATE.lock().await;
+        auth.consecutive_rtdb_auth_errors = 0;
+        auth.force_refresh = false;
+    }
+    SSE_WAKE_SIGNAL.signal(());
+}
+
+/// Performs a single Zero-Touch registration POST to `VERIFY_PAIRING_URL` with `FACTORY_PASSKEY`
+/// and returns the Firebase `customToken` on HTTP 200.
+async fn register_device_once(
     stack: Stack<'static>,
     device_id: &str,
     esp_uid: &str,
 ) -> Option<String> {
-    let window_start = Instant::now();
-    let window_duration = Duration::from_secs(PAIRING_WINDOW_SECS);
-
-    println!(
-        "PAIRING: 5-minute pairing window opened for {} (espUid={})",
-        device_id, esp_uid
-    );
-
-    loop {
-        if !stack.is_config_up() {
-            stack.wait_config_up().await;
-        }
-        if window_start.elapsed() >= window_duration {
-            break;
-        }
-
-        println!("PAIRING: Sending verifyPairing POST to {}", CLOUD_FUNC_URL);
-        let res = {
-            let _call = HTTPS_CALL_LOCK.lock().await;
-            {
-                let mut scratch = HTTPS_SCRATCH.lock().await;
-                scratch.url_buf.clear();
-                let _ = scratch.url_buf.write_str(CLOUD_FUNC_URL);
-                scratch.req_buf.clear();
-                let _ = write!(
-                    scratch.req_buf,
-                    r#"{{"deviceId":"{}","pin":"{}","espUid":"{}"}}"#,
-                    device_id, FACTORY_PASSKEY, esp_uid
-                );
-                scratch.job = HttpsJob {
-                    method: Method::POST,
-                    extra_header: HttpsExtraHeader::EspAuthToken,
-                    json_content_type: true,
-                    has_body: true,
-                    status: 0,
-                    resp_len: 0,
-                    err: None,
-                };
-            }
-            dispatch_https_job(|status, body| {
-                let token = if status == 200 {
-                    serde_json::from_slice::<VerifyPairingResp>(body)
-                        .ok()
-                        .and_then(|r| r.custom_token)
-                } else {
-                    None
-                };
-                (status, token)
-            })
-            .await
-        };
-
-        match res {
-            Ok((200, Some(ct))) if !ct.is_empty() => {
-                println!(
-                    "PAIRING: Pairing successful (HTTP 200) for {}; received customToken.",
-                    device_id
-                );
-                return Some(ct);
-            }
-            Ok((200, _)) => {
-                println!("PAIRING: HTTP 200 without customToken; retrying...");
-            }
-            Ok((code @ (400 | 401 | 403 | 404), _)) => {
-                println!("PAIRING: verifyPairing returned status: {}", code);
-            }
-            Ok((code, _)) => {
-                println!("PAIRING: verifyPairing returned unexpected status: {}", code);
-            }
-            Err(e) => {
-                println!("PAIRING: verifyPairing request failed: {}", e);
-            }
-        }
-
-        let Some(remaining) = window_duration.checked_sub(window_start.elapsed()) else {
-            break;
-        };
-        if remaining.as_millis() == 0 {
-            break;
-        }
-        let retry_delay = Duration::from_secs(PAIRING_RETRY_INTERVAL_SECS);
-        Timer::after(if remaining < retry_delay {
-            remaining
-        } else {
-            retry_delay
-        })
-        .await;
+    if !stack.is_config_up() {
+        stack.wait_config_up().await;
     }
 
     println!(
-        "PAIRING: 5-minute pairing window closed for {} without pairing (re-open via Hard Reset or Portal/PWA Restart).",
-        device_id
+        "AUTH: Sending Zero-Touch registration POST to {}",
+        VERIFY_PAIRING_URL
     );
-    None
+    let res = {
+        let _call = HTTPS_CALL_LOCK.lock().await;
+        {
+            let mut scratch = HTTPS_SCRATCH.lock().await;
+            scratch.url_buf.clear();
+            let _ = scratch.url_buf.write_str(VERIFY_PAIRING_URL);
+            scratch.req_buf.clear();
+            let _ = write!(
+                scratch.req_buf,
+                r#"{{"deviceId":"{}","espUid":"{}","passkey":"{}","pin":"{}"}}"#,
+                device_id, esp_uid, FACTORY_PASSKEY, FACTORY_PASSKEY
+            );
+            scratch.job = HttpsJob {
+                method: Method::POST,
+                extra_header: HttpsExtraHeader::EspAuthToken,
+                json_content_type: true,
+                has_body: true,
+                ..HttpsJob::new()
+            };
+        }
+        dispatch_https_job(|status, body| {
+            let token = if status == 200 {
+                serde_json::from_slice::<VerifyPairingResp>(body)
+                    .ok()
+                    .and_then(|r| r.custom_token)
+            } else {
+                None
+            };
+            (status, token)
+        })
+        .await
+    };
+
+    match res {
+        Ok((200, Some(ct))) if !ct.is_empty() => {
+            println!(
+                "AUTH: Zero-Touch registration succeeded (HTTP 200) for {}; received customToken.",
+                device_id
+            );
+            Some(ct)
+        }
+        Ok((200, _)) => {
+            println!("AUTH: verifyPairing returned HTTP 200 without customToken.");
+            None
+        }
+        Ok((code, _)) => {
+            println!("AUTH: verifyPairing returned HTTP {}.", code);
+            None
+        }
+        Err(e) => {
+            println!("AUTH: verifyPairing request failed: {}", e);
+            None
+        }
+    }
 }
 
 /// Exchanges a Firebase `customToken` for an `idToken` (RAM) and `refreshToken` (SLN3 NVS).
@@ -2153,9 +2206,7 @@ async fn exchange_custom_token(custom_token: &str) -> bool {
                 extra_header: HttpsExtraHeader::None,
                 json_content_type: true,
                 has_body: true,
-                status: 0,
-                resp_len: 0,
-                err: None,
+                ..HttpsJob::new()
             };
             ok
         };
@@ -2248,9 +2299,7 @@ async fn refresh_id_token_via_nvs() -> RefreshOutcome {
                 extra_header: HttpsExtraHeader::FormUrlEncoded,
                 json_content_type: false,
                 has_body: true,
-                status: 0,
-                resp_len: 0,
-                err: None,
+                ..HttpsJob::new()
             };
             ok
         };
@@ -2265,21 +2314,41 @@ async fn refresh_id_token_via_nvs() -> RefreshOutcome {
             } else {
                 None
             };
-            (status, parsed)
+            let err_msg = if status == 400 || status == 401 || status == 403 {
+                serde_json::from_slice::<FirebaseErrResp>(resp_body)
+                    .ok()
+                    .and_then(|e| e.error)
+                    .and_then(|d| d.message)
+                    .or_else(|| {
+                        core::str::from_utf8(resp_body)
+                            .ok()
+                            .map(|s| s.chars().take(160).collect())
+                    })
+            } else {
+                None
+            };
+            (status, parsed, err_msg)
         })
         .await
     };
 
     match res {
-        Ok((200, Some(resp))) => {
+        Ok((200, Some(resp), _)) => {
             if let Some(id_tok) = resp.id_token
                 && !id_tok.is_empty()
             {
+                let still_paired = nvs_read_with(|nvs| nvs.refresh_token_len > 0).await;
+                if !still_paired {
+                    println!("AUTH: Unpaired while refresh was in flight; discarding refreshed token.");
+                    return RefreshOutcome::Revoked;
+                }
                 if let Some(new_rt) = resp.refresh_token
                     && !new_rt.is_empty()
                 {
                     let _ = nvs_update(|nvs| {
-                        if nvs.refresh_token_str() != Some(new_rt.as_str()) {
+                        if nvs.refresh_token_len > 0
+                            && nvs.refresh_token_str() != Some(new_rt.as_str())
+                        {
                             nvs.set_refresh_token(&new_rt)
                         } else {
                             false
@@ -2296,14 +2365,31 @@ async fn refresh_id_token_via_nvs() -> RefreshOutcome {
             }
             RefreshOutcome::TransientError
         }
-        Ok((code @ (400 | 401 | 403), _)) => {
+        Ok((400, _, err_opt)) => {
+            let msg = err_opt.as_deref().unwrap_or("");
+            if is_revoked_refresh_error(msg) {
+                println!(
+                    "AUTH: securetoken rejected refresh_token (HTTP 400: {}); clearing SLN3 refresh_token.",
+                    msg
+                );
+                RefreshOutcome::Revoked
+            } else {
+                println!(
+                    "AUTH: securetoken returned HTTP 400 ({}); retrying...",
+                    msg
+                );
+                RefreshOutcome::TransientError
+            }
+        }
+        Ok((code @ (401 | 403), _, err_opt)) => {
             println!(
-                "AUTH: Refresh token rejected/revoked (HTTP {}); clearing SLN3 refresh_token.",
-                code
+                "AUTH: Refresh token rejected/revoked (HTTP {}: {}); clearing SLN3 refresh_token.",
+                code,
+                err_opt.as_deref().unwrap_or("")
             );
             RefreshOutcome::Revoked
         }
-        Ok((status, _)) => {
+        Ok((status, _, _)) => {
             println!("AUTH: securetoken returned HTTP {}", status);
             RefreshOutcome::TransientError
         }
@@ -2314,7 +2400,7 @@ async fn refresh_id_token_via_nvs() -> RefreshOutcome {
     }
 }
 
-/// Manages pairing (`verifyPairing`), Custom Token exchange, and 45-min `id_token` refresh lifecycle.
+/// Manages Zero-Touch registration (`verifyPairing`), Custom Token exchange, and 45-min `id_token` refresh lifecycle.
 #[embassy_executor::task]
 async fn auth_task(stack: Stack<'static>) -> ! {
     stack.wait_config_up().await;
@@ -2322,6 +2408,8 @@ async fn auth_task(stack: Stack<'static>) -> ! {
     let device_id = build_device_name();
     let esp_uid = build_esp_uid();
     let mut backoff_secs: u64 = 5;
+    let reg_backoff_steps = [5u64, 15, 30, 60];
+    let mut reg_backoff_idx: usize = 0;
 
     loop {
         if !stack.is_config_up() {
@@ -2346,19 +2434,8 @@ async fn auth_task(stack: Stack<'static>) -> ! {
             };
 
             if rtdb_errors >= 2 {
-                println!("AUTH: Repeated RTDB 401/403 after fresh token; treating device as unpaired.");
-                clear_auth_id_token().await;
-                let _ = nvs_update(|d| {
-                    d.clear_refresh_token();
-                    true
-                })
-                .await;
-                {
-                    let mut auth = AUTH_STATE.lock().await;
-                    auth.consecutive_rtdb_auth_errors = 0;
-                    auth.force_refresh = false;
-                }
-                SSE_WAKE_SIGNAL.signal(());
+                clear_auth_for_reregistration("Repeated RTDB 401/403 after fresh token").await;
+                reg_backoff_idx = 0;
                 continue;
             }
 
@@ -2368,18 +2445,8 @@ async fn auth_task(stack: Stack<'static>) -> ! {
                         backoff_secs = 5;
                     }
                     RefreshOutcome::Revoked => {
-                        clear_auth_id_token().await;
-                        let _ = nvs_update(|d| {
-                            d.clear_refresh_token();
-                            true
-                        })
-                        .await;
-                        {
-                            let mut auth = AUTH_STATE.lock().await;
-                            auth.consecutive_rtdb_auth_errors = 0;
-                            auth.force_refresh = false;
-                        }
-                        SSE_WAKE_SIGNAL.signal(());
+                        clear_auth_for_reregistration("Refresh token rejected/revoked").await;
+                        reg_backoff_idx = 0;
                         continue;
                     }
                     RefreshOutcome::TransientError => {
@@ -2395,19 +2462,23 @@ async fn auth_task(stack: Stack<'static>) -> ! {
             let _ = select(Timer::after(Duration::from_secs(2)), AUTH_WAKE_SIGNAL.wait()).await;
         } else {
             clear_auth_id_token().await;
+            AUTH_WAKE_SIGNAL.reset();
             if let Some(custom_token) =
-                poll_verify_pairing(stack, &device_id, &esp_uid).await
+                register_device_once(stack, &device_id, &esp_uid).await
+                && exchange_custom_token(&custom_token).await
             {
-                for attempt in 1..=3 {
-                    if exchange_custom_token(&custom_token).await {
-                        break;
-                    }
-                    println!("AUTH: Custom token exchange attempt {}/3 failed; retrying...", attempt);
-                    Timer::after(Duration::from_secs(3)).await;
-                }
+                reg_backoff_idx = 0;
+                backoff_secs = 5;
             } else {
-                // 5-minute pairing window closed without pairing; sleep until woken (or reboot).
-                AUTH_WAKE_SIGNAL.wait().await;
+                let wait = Duration::from_secs(reg_backoff_steps[reg_backoff_idx]);
+                if reg_backoff_idx + 1 < reg_backoff_steps.len() {
+                    reg_backoff_idx += 1;
+                }
+                println!(
+                    "AUTH: Zero-Touch registration retry in {}s...",
+                    wait.as_secs()
+                );
+                let _ = select(Timer::after(wait), AUTH_WAKE_SIGNAL.wait()).await;
             }
         }
     }
@@ -2420,6 +2491,7 @@ struct CmdUpdate {
     sens: Option<u8>,
     dur: Option<u64>,
     safe: Option<u16>,
+    wattage: Option<u16>,
 }
 
 fn parse_cmd_update_from_sse(json_str: &str) -> Option<CmdUpdate> {
@@ -2437,6 +2509,7 @@ fn parse_cmd_update_from_sse(json_str: &str) -> Option<CmdUpdate> {
         sens: None,
         dur: None,
         safe: None,
+        wattage: None,
     };
 
     let parse_thr = |v: &serde_json::Value| {
@@ -2455,6 +2528,11 @@ fn parse_cmd_update_from_sse(json_str: &str) -> Option<CmdUpdate> {
             .and_then(|n| u16::try_from(n).ok())
             .filter(|n| *n <= 1440)
     };
+    let parse_wattage = |v: &serde_json::Value| {
+        v.as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .filter(|n| *n <= 5000)
+    };
 
     match path {
         "/" => {
@@ -2465,6 +2543,10 @@ fn parse_cmd_update_from_sse(json_str: &str) -> Option<CmdUpdate> {
             upd.sens = obj.get("sens").and_then(parse_sens);
             upd.dur = obj.get("dur").and_then(parse_dur);
             upd.safe = obj.get("safe").and_then(parse_safe);
+            upd.wattage = obj
+                .get("wattage")
+                .or_else(|| obj.get("lamp_wattage_w"))
+                .and_then(parse_wattage);
         }
         "/lamp" => upd.lamp = data.as_bool(),
         "/restart" => upd.restart = data.as_bool(),
@@ -2472,14 +2554,21 @@ fn parse_cmd_update_from_sse(json_str: &str) -> Option<CmdUpdate> {
         "/sens" => upd.sens = parse_sens(data),
         "/dur" => upd.dur = parse_dur(data),
         "/safe" => upd.safe = parse_safe(data),
+        "/wattage" | "/lamp_wattage_w" => upd.wattage = parse_wattage(data),
         _ => return None,
     }
 
     Some(upd)
 }
 
-async fn apply_cmd_update(device_id: &str, upd: CmdUpdate) {
-    let new_cfg = {
+enum RestartOutcome {
+    NotRequested,
+    AuthError,
+    Failed,
+}
+
+async fn apply_cmd_update(device_id: &str, upd: CmdUpdate) -> RestartOutcome {
+    let (new_cfg, wattage_changed) = {
         let mut state = DEVICE_STATE.lock().await;
         if let Some(lamp_on) = upd.lamp {
             if state.remote_lamp_on != lamp_on {
@@ -2499,15 +2588,26 @@ async fn apply_cmd_update(device_id: &str, upd: CmdUpdate) {
         if let Some(v) = upd.safe {
             state.safety_off_min = v;
         }
-        DeviceConfig {
-            threshold: state.threshold,
-            sensitivity: state.sensitivity,
-            duration: state.duration,
-            safety_off_min: state.safety_off_min,
+        let mut wattage_changed = false;
+        if let Some(v) = upd.wattage
+            && state.lamp_wattage_w != v
+        {
+            state.lamp_wattage_w = v;
+            wattage_changed = true;
         }
+        (state.to_config(), wattage_changed)
     };
 
-    if upd.thr.is_some() || upd.sens.is_some() || upd.dur.is_some() || upd.safe.is_some() {
+    if wattage_changed {
+        REPORTER_STATE_SIGNAL.signal(());
+    }
+
+    if upd.thr.is_some()
+        || upd.sens.is_some()
+        || upd.dur.is_some()
+        || upd.safe.is_some()
+        || upd.wattage.is_some()
+    {
         let saved = nvs_update(|nvs| {
             let mut candidate = nvs.config;
             if let Some(v) = upd.thr {
@@ -2522,6 +2622,9 @@ async fn apply_cmd_update(device_id: &str, upd: CmdUpdate) {
             if let Some(v) = upd.safe {
                 candidate.safety_off_min = v;
             }
+            if let Some(v) = upd.wattage {
+                candidate.lamp_wattage_w = v;
+            }
             if candidate != nvs.config && candidate.is_configured() {
                 nvs.config = candidate;
                 true
@@ -2534,15 +2637,19 @@ async fn apply_cmd_update(device_id: &str, upd: CmdUpdate) {
 
         if saved {
             println!(
-                "SSE: Config changed -> saved to SLN3 NVS (thr={}, sens={}, dur={}s, safe={}m).",
-                new_cfg.threshold, new_cfg.sensitivity, new_cfg.duration, new_cfg.safety_off_min
+                "SSE: Config changed -> saved to SLN3 NVS (thr={}, sens={}, dur={}s, safe={}m, wattage={}W).",
+                new_cfg.threshold,
+                new_cfg.sensitivity,
+                new_cfg.duration,
+                new_cfg.safety_off_min,
+                new_cfg.lamp_wattage_w
             );
         }
     }
 
     if upd.restart == Some(true) {
-        println!("SSE: Remote restart requested! Clearing restart flag and rebooting...");
-        {
+        println!("SSE: Remote restart requested! Clearing cmd/restart=false in RTDB before reboot...");
+        let ack_res = {
             let _call = HTTPS_CALL_LOCK.lock().await;
             let has_token = {
                 let mut scratch = HTTPS_SCRATCH.lock().await;
@@ -2569,19 +2676,53 @@ async fn apply_cmd_update(device_id: &str, upd: CmdUpdate) {
                     extra_header: HttpsExtraHeader::None,
                     json_content_type: true,
                     has_body: true,
-                    status: 0,
-                    resp_len: 0,
-                    err: None,
+                    timeout_ms: 3_500,
+                    ..HttpsJob::new()
                 };
                 ok
             };
             if has_token {
-                let _ = dispatch_https_job(|status, _| status).await;
+                dispatch_https_job(|status, _| status).await
+            } else {
+                Ok(401u16)
+            }
+        };
+
+        match ack_res {
+            Ok(status) if (200..=299).contains(&status) => {
+                mark_rtdb_ok().await;
+                println!(
+                    "RESTART: Cleared cmd/restart=false in RTDB (HTTP {}); rebooting now...",
+                    status
+                );
+                Timer::after(Duration::from_millis(250)).await;
+                esp_hal::system::software_reset();
+            }
+            Ok(status @ (401 | 403)) => {
+                println!(
+                    "RESTART: Failed to clear cmd/restart=false (HTTP {}); aborting reboot.",
+                    status
+                );
+                return RestartOutcome::AuthError;
+            }
+            Ok(status) => {
+                println!(
+                    "RESTART: Failed to clear cmd/restart=false (HTTP {}); aborting reboot.",
+                    status
+                );
+                return RestartOutcome::Failed;
+            }
+            Err(e) => {
+                println!(
+                    "RESTART: Failed to clear cmd/restart=false ({}); aborting reboot.",
+                    e
+                );
+                return RestartOutcome::Failed;
             }
         }
-        Timer::after(Duration::from_millis(500)).await;
-        esp_hal::system::software_reset();
     }
+
+    RestartOutcome::NotRequested
 }
 
 /// Listens to `/live/<deviceId>/cmd.json` via Firebase RTDB Server-Sent Events (SSE).
@@ -2738,7 +2879,7 @@ async fn rtdb_sse_listener_task(stack: Stack<'static>, seed: u64) -> ! {
                                                 if line.is_empty() {
                                                     let ev = current_event.as_str();
                                                     if ev == "auth_revoked" || ev == "cancel" {
-                                                        println!("SSE: Received '{}' event.", ev);
+                                                        println!("SSE: Received '{}' event; refreshing auth token.", ev);
                                                         frame_action = Some(SseStopReason::AuthError);
                                                         break;
                                                     } else if (ev == "put" || ev == "patch")
@@ -2756,7 +2897,7 @@ async fn rtdb_sse_listener_task(stack: Stack<'static>, seed: u64) -> ! {
                                                                 );
                                                                 break;
                                                             } else {
-                                                                apply_cmd_update(&device_id, upd)
+                                                                let _ = apply_cmd_update(&device_id, upd)
                                                                     .await;
                                                             }
                                                         }
@@ -2815,7 +2956,29 @@ async fn rtdb_sse_listener_task(stack: Stack<'static>, seed: u64) -> ! {
         match stop_reason {
             SseStopReason::ApplyRestart => {
                 if let Some(upd) = pending_restart_upd.take() {
-                    apply_cmd_update(&device_id, upd).await;
+                    match apply_cmd_update(&device_id, upd).await {
+                        RestartOutcome::AuthError => {
+                            mark_rtdb_auth_error().await;
+                            AUTH_WAKE_SIGNAL.signal(());
+                            let _ = select(
+                                Timer::after(Duration::from_secs(5)),
+                                SSE_WAKE_SIGNAL.wait(),
+                            )
+                            .await;
+                        }
+                        RestartOutcome::Failed => {
+                            let delay = backoff_steps[backoff_idx];
+                            if backoff_idx + 1 < backoff_steps.len() {
+                                backoff_idx += 1;
+                            }
+                            let _ = select(
+                                Timer::after(Duration::from_secs(delay)),
+                                SSE_WAKE_SIGNAL.wait(),
+                            )
+                            .await;
+                        }
+                        RestartOutcome::NotRequested => {}
+                    }
                 }
             }
             SseStopReason::TokenRotated => {
@@ -2864,7 +3027,7 @@ async fn rtdb_state_reporter_task(stack: Stack<'static>) -> ! {
             continue;
         }
 
-        let (lamp_on, auto_on, lux, mot, energy_delta, p1_off) = {
+        let (lamp_on, auto_on, lux, mot, energy_delta, p1_off, wattage) = {
             let state = DEVICE_STATE.lock().await;
             (
                 state.lamp_is_on,
@@ -2873,6 +3036,7 @@ async fn rtdb_state_reporter_task(stack: Stack<'static>) -> ! {
                 state.pir_active,
                 state.pending_energy_sec.min(86400),
                 state.pending_p1_off,
+                state.lamp_wattage_w.min(5000),
             )
         };
 
@@ -2899,17 +3063,15 @@ async fn rtdb_state_reporter_task(stack: Stack<'static>) -> ! {
                 scratch.req_buf.clear();
                 let _ = write!(
                     scratch.req_buf,
-                    r#"{{"on":{},"auto":{},"lux":{},"mot":{},"ts":{{".sv":"timestamp"}},"energy_delta_sec":{},"p1_off":{}}}"#,
-                    lamp_on, auto_on, lux, mot, energy_delta, p1_off
+                    r#"{{"on":{},"auto":{},"lux":{},"mot":{},"ts":{{".sv":"timestamp"}},"energy_delta_sec":{},"p1_off":{},"wattage":{}}}"#,
+                    lamp_on, auto_on, lux, mot, energy_delta, p1_off, wattage
                 );
                 scratch.job = HttpsJob {
                     method: Method::PATCH,
                     extra_header: HttpsExtraHeader::None,
                     json_content_type: true,
                     has_body: true,
-                    status: 0,
-                    resp_len: 0,
-                    err: None,
+                    ..HttpsJob::new()
                 };
                 ok
             };
@@ -3652,6 +3814,7 @@ async fn main(spawner: Spawner) {
         state.sensitivity = boot_cfg.sensitivity;
         state.duration = boot_cfg.duration;
         state.safety_off_min = boot_cfg.safety_off_min;
+        state.lamp_wattage_w = boot_cfg.lamp_wattage_w;
     }
 
     // Hardware Safety: do not drive physical relay/sensor GPIO pins yet; only WS2812 mirrors lamp_is_on.
@@ -3713,12 +3876,7 @@ async fn main(spawner: Spawner) {
                 if connect_sta_with_timeout(sta_stack, &mut controller, &candidate_creds).await {
                     let cur_cfg = {
                         let state = DEVICE_STATE.lock().await;
-                        DeviceConfig {
-                            threshold: state.threshold,
-                            sensitivity: state.sensitivity,
-                            duration: state.duration,
-                            safety_off_min: state.safety_off_min,
-                        }
+                        state.to_config()
                     };
                     let save_res = nvs_update(|nvs| {
                         nvs.config = cur_cfg;
