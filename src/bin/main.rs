@@ -77,7 +77,7 @@ const MAX_REFRESH_TOKEN_LEN: usize = 320;
 
 const FACTORY_PASSKEY: &str = "K7M9P2X4R8";
 const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
-const AP_BOOT_WINDOW_SECS: u64 = 300;
+const AP_BOOT_WINDOW_SECS: u64 = 120;
 const PAIRING_WINDOW_SECS: u64 = 300;
 const PAIRING_RETRY_INTERVAL_SECS: u64 = 10;
 const MAX_POST_BODY_BYTES: usize = 512;
@@ -916,11 +916,14 @@ async fn send_portal_html_chunked(
           .btn-danger{background:#b91c1c;height:38px;font-size:14px}\
           .btn-lamp-on{background:#16a34a}\
           .btn-lamp-off{background:#475569}\
-          .err-slot{height:36px;min-height:36px;display:flex;align-items:center;justify-content:center;\
+          .err-slot{height:36px;min-height:36px;display:flex;align-items:center;justify-content:center;gap:8px;\
           text-align:center;font-size:13px;font-weight:600;line-height:1.3;flex-shrink:0}\
           .slot-err{color:#f87171}\
           .slot-info{color:#fbbf24}\
           .err-hidden{visibility:hidden}\
+          .btn-icon{width:28px;height:28px;min-width:28px;padding:0;border-radius:6px;background:#2563eb;\
+          color:#f8fafc;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}\
+          .btn-icon svg{width:15px;height:15px;display:block}\
           .sys-sec{border-top:1px solid #334155;padding-top:8px;display:flex;flex-direction:column;gap:6px;flex-shrink:0}\
           .sys-lbl{font-size:13px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.03em}\
           .cfg-card{margin:auto 0;border:1px solid #334155;border-radius:12px;background:#1e293b;\
@@ -1006,22 +1009,38 @@ async fn send_portal_html_chunked(
     write_http_chunk(socket, chunk.as_bytes()).await;
 
     chunk.clear();
+    let show_connect_now = !last_wifi_error && remaining_secs.is_some_and(|s| s > 0);
     if last_wifi_error {
         let _ = chunk.write_str(
-            "<div id='wifi-err-slot' class='err-slot slot-err'>Sikertelen Wi-Fi csatlakozás.</div>",
+            "<div id='wifi-err-slot' class='err-slot slot-err'><span id='wifi-msg'>Sikertelen Wi-Fi csatlakozás.</span>",
         );
     } else if let Some(secs) = remaining_secs {
-        let _ = write!(
-            chunk,
-            "<div id='wifi-err-slot' class='err-slot slot-info'>Mentett WiFi hálózatot találtam. Csatlakozás {:02}:{:02} múlva</div>",
-            secs / 60,
-            secs % 60
-        );
+        if secs > 0 {
+            let _ = write!(
+                chunk,
+                "<div id='wifi-err-slot' class='err-slot slot-info'><span id='wifi-msg'>Mentett WiFi hálózatot találtam. Csatlakozás {:02}:{:02} múlva</span>",
+                secs / 60,
+                secs % 60
+            );
+        } else {
+            let _ = chunk.write_str(
+                "<div id='wifi-err-slot' class='err-slot slot-info'><span id='wifi-msg'>Csatlakozás...</span>",
+            );
+        }
     } else {
         let _ = chunk.write_str(
-            "<div id='wifi-err-slot' class='err-slot err-hidden'>\u{00a0}</div>",
+            "<div id='wifi-err-slot' class='err-slot err-hidden'><span id='wifi-msg'>\u{00a0}</span>",
         );
     }
+    let btn_cls = if show_connect_now { "btn-icon" } else { "btn-icon hidden" };
+    let _ = write!(
+        chunk,
+        "<button type='button' id='connectNowBtn' class='{bcls}' title='Azonnali csatlakozás' aria-label='Azonnali csatlakozás' onclick='connectSavedNow()'><svg viewBox='0 0 24 24' fill='currentColor' aria-hidden='true'><path d='M8 5v14l11-7z'/></svg></button></div>",
+        bcls = btn_cls,
+    );
+    write_http_chunk(socket, chunk.as_bytes()).await;
+
+    chunk.clear();
     let _ = chunk.write_str(
         "<div class='sys-sec'><div class='sys-lbl'>Rendszerműveletek</div><div class='grid2'>\
          <button type='button' id='clearWifiBtn' class='btn-warn' onclick='clearWifi()'>Wi-Fi adatok törlése</button>\
@@ -1137,13 +1156,16 @@ async fn send_portal_html_chunked(
 
     write_http_chunk(
         socket,
-        "function fmtMmSs(s){const m=Math.floor(s/60),sec=s%60;return String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0');}\
-          function renderRow9(){const el=document.getElementById('wifi-err-slot');\
-          if(wifiErr){el.className='err-slot slot-err';el.textContent='Sikertelen Wi-Fi csatlakozás.';}\
-          else if(remSecs!==null&&remSecs>=0){el.className='err-slot slot-info';el.textContent='Mentett WiFi hálózatot találtam. Csatlakozás '+fmtMmSs(remSecs)+' múlva';}\
-          else{el.className='err-slot err-hidden';el.textContent='\\u00a0';}}\
+        "let connectingNow=false;\
+          function fmtMmSs(s){const m=Math.floor(s/60),sec=s%60;return String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0');}\
+          function renderRow9(){const el=document.getElementById('wifi-err-slot'),msg=document.getElementById('wifi-msg'),btn=document.getElementById('connectNowBtn');\
+          if(connectingNow){el.className='err-slot slot-info';msg.textContent='Csatlakozás...';btn.classList.add('hidden');btn.disabled=true;}\
+          else if(wifiErr){el.className='err-slot slot-err';msg.textContent='Sikertelen Wi-Fi csatlakozás.';btn.classList.add('hidden');}\
+          else if(remSecs!==null&&remSecs>0){el.className='err-slot slot-info';msg.textContent='Mentett WiFi hálózatot találtam. Csatlakozás '+fmtMmSs(remSecs)+' múlva';btn.classList.remove('hidden');btn.disabled=false;}\
+          else if(remSecs===0){el.className='err-slot slot-info';msg.textContent='Csatlakozás...';btn.classList.add('hidden');btn.disabled=true;}\
+          else{el.className='err-slot err-hidden';msg.textContent='\\u00a0';btn.classList.add('hidden');}}\
           renderRow9();\
-          setInterval(()=>{if(!wifiErr&&remSecs!==null&&remSecs>0){remSecs--;renderRow9();}},1000);\
+          setInterval(()=>{if(!wifiErr&&!connectingNow&&remSecs!==null&&remSecs>0){remSecs--;renderRow9();}},1000);\
           function showView(v){document.getElementById('view-main').classList.toggle('hidden',v!=='main');\
           document.getElementById('view-config').classList.toggle('hidden',v!=='config');}\
           function openModal(id){document.getElementById(id).classList.remove('hidden');}\
@@ -1160,7 +1182,10 @@ async fn send_portal_html_chunked(
     write_http_chunk(
         socket,
         "setInterval(async()=>{try{const r=await fetch('/status');if(!r.ok)return;const d=await r.json();\
-          updateLampUi(d.lamp_is_on);wifiErr=!!d.wifi_error;remSecs=(typeof d.remaining_secs==='number')?d.remaining_secs:null;renderRow9();}catch(_){}},5000);\
+          updateLampUi(d.lamp_is_on);if(!connectingNow){wifiErr=!!d.wifi_error;remSecs=(typeof d.remaining_secs==='number')?d.remaining_secs:null;renderRow9();}}catch(_){}},5000);\
+          async function connectSavedNow(){const btn=document.getElementById('connectNowBtn');if(!btn||connectingNow)return;\
+          btn.disabled=true;connectingNow=true;renderRow9();\
+          try{const r=await fetch('/connect-saved',{method:'POST'});if(!r.ok){connectingNow=false;renderRow9();}}catch(_){}}\
           async function scanWifi(){const btn=document.getElementById('scanBtn'),sel=document.getElementById('ssid');\
           btn.disabled=true;btn.textContent='Keresés...';\
           try{const r=await fetch('/scan?refresh=1');const arr=await r.json();const cur=sel.value;\
@@ -1172,10 +1197,10 @@ async fn send_portal_html_chunked(
           if(!s||!p)return;openModal('wifiConfirmModal');}\
           async function confirmAndSubmitWifi(){const ssid=document.getElementById('ssid').value,pass=document.getElementById('pass').value;\
           if(!ssid||!pass)return;const cb=document.getElementById('confirmConnectBtn');cb.disabled=true;cb.textContent='Csatlakozás folyamatban...';\
-          document.getElementById('connectBtn').disabled=true;wifiErr=false;remSecs=null;renderRow9();\
+          document.getElementById('connectBtn').disabled=true;wifiErr=false;connectingNow=false;remSecs=null;renderRow9();\
           try{await fetch('/connect-wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,pass})});}catch(_){}}\
           async function clearWifi(){const btn=document.getElementById('clearWifiBtn');btn.disabled=true;\
-          try{const r=await fetch('/clear-wifi',{method:'POST'});if(r.ok){wifiErr=false;remSecs=null;renderRow9();btn.textContent='Törölve';\
+          try{const r=await fetch('/clear-wifi',{method:'POST'});if(r.ok){wifiErr=false;connectingNow=false;remSecs=null;renderRow9();btn.textContent='Törölve';\
           setTimeout(()=>{btn.textContent='Wi-Fi adatok törlése';btn.disabled=false;},1500);return;}}catch(_){}\
           btn.disabled=false;}".as_bytes(),
     )
@@ -1404,6 +1429,33 @@ async fn http_portal_server(
                         "400 Bad Request",
                         "application/json",
                         "{\"ok\":false,\"error\":\"Érvénytelen SSID vagy jelszó\"}",
+                    )
+                    .await;
+                }
+                ("POST", "/connect-saved") | ("POST", "/api/connect-saved") => {
+                    let has_saved_wifi = nvs_read_with(|nvs| nvs.wifi.is_some()).await;
+                    if has_saved_wifi {
+                        println!(
+                            "PORTAL: Immediate connect to saved Wi-Fi requested; expiring AP countdown."
+                        );
+                        *last_wifi_error = false;
+                        send_http_response(
+                            &mut socket,
+                            "200 OK",
+                            "application/json",
+                            "{\"ok\":true,\"connecting\":true}",
+                        )
+                        .await;
+                        socket.close();
+                        Timer::after(Duration::from_millis(350)).await;
+                        *ap_deadline.lock().await = Some(Instant::now());
+                        continue;
+                    }
+                    send_http_response(
+                        &mut socket,
+                        "400 Bad Request",
+                        "application/json",
+                        "{\"ok\":false,\"error\":\"Nincs mentett Wi-Fi hálózat\"}",
                     )
                     .await;
                 }
@@ -3691,7 +3743,10 @@ async fn main(spawner: Spawner) {
             PortalOutcome::TimeoutExpired => {
                 let saved_wifi = nvs_read_with(|d| d.wifi.clone()).await;
                 if let Some(saved_creds) = saved_wifi {
-                    println!("300s AP window expired; connecting to saved Wi-Fi...");
+                    println!(
+                        "{}s AP window expired; connecting to saved Wi-Fi...",
+                        AP_BOOT_WINDOW_SECS
+                    );
                     if connect_sta_with_timeout(sta_stack, &mut controller, &saved_creds).await {
                         sta_online_keepalive(sta_stack, &mut controller).await;
                     } else {
