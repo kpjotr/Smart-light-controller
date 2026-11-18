@@ -82,7 +82,7 @@ const AP_BOOT_WINDOW_SECS: u64 = 120;
 const MAX_POST_BODY_BYTES: usize = 512;
 const KEEPALIVE_INTERVAL_SECS: u64 = 15;
 const VERIFY_PAIRING_URL: &str = "https://verifypairing-lfmgd4eena-uc.a.run.app";
-const ESP_AUTH_TOKEN: &str = "ESP32_SECRET_TOKEN_998877";
+const ESP_AUTH_TOKEN: Option<&str> = option_env!("ESP_AUTH_TOKEN");
 const FIREBASE_WEB_API_KEY: &str = "AIzaSyCymXk2RyRcQ3Rn5JSvJvJeQIMAxH0KyQU";
 const RTDB_HOST: &str = "okospilacsvezerlo-default-rtdb.europe-west1.firebasedatabase.app";
 const AUTH_CUSTOM_TOKEN_URL_BASE: &str =
@@ -1932,11 +1932,16 @@ async fn https_worker_task(stack: Stack<'static>, seed: u64) -> ! {
                     .await
                     .map_err(|_| "HTTP request init failed")?;
 
-                let esp_hdr = [("X-Esp-Auth-Token", ESP_AUTH_TOKEN)];
+                let esp_hdr = ESP_AUTH_TOKEN.map(|token| [("X-Esp-Auth-Token", token)]);
                 let form_hdr = [("Content-Type", "application/x-www-form-urlencoded")];
                 match job.extra_header {
                     HttpsExtraHeader::None => {}
-                    HttpsExtraHeader::EspAuthToken => req = req.headers(&esp_hdr),
+                    HttpsExtraHeader::EspAuthToken => {
+                        let header = esp_hdr
+                            .as_ref()
+                            .ok_or("ESP_AUTH_TOKEN is not configured")?;
+                        req = req.headers(header);
+                    }
                     HttpsExtraHeader::FormUrlEncoded => req = req.headers(&form_hdr),
                 }
                 if job.json_content_type {

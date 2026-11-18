@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rerun-if-env-changed=ESP_AUTH_TOKEN");
     linker_be_nice();
     check_xtensa_linker_available();
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
