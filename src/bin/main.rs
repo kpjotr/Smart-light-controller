@@ -3008,17 +3008,21 @@ async fn rtdb_sse_listener_task(stack: Stack<'static>, seed: u64) -> ! {
     }
 }
 
-/// Reports device state & energy delta (`PATCH /live/<deviceId>/state.json`) on state changes or 20s heartbeat.
+/// Reports device state & energy delta (`PATCH /live/<deviceId>/state.json`) immediately on
+/// startup/reconnect, on local state changes, or on 20s heartbeat using RTDB server timestamps.
 #[embassy_executor::task]
 async fn rtdb_state_reporter_task(stack: Stack<'static>) -> ! {
     let device_id = build_device_name();
+    let mut immediate_publish = true;
 
     loop {
         if !stack.is_config_up() {
+            immediate_publish = true;
             stack.wait_config_up().await;
         }
 
         if !has_auth_id_token().await {
+            immediate_publish = true;
             let _ = select(
                 Timer::after(Duration::from_secs(5)),
                 REPORTER_STATE_SIGNAL.wait(),
@@ -3026,6 +3030,8 @@ async fn rtdb_state_reporter_task(stack: Stack<'static>) -> ! {
             .await;
             continue;
         }
+
+        REPORTER_STATE_SIGNAL.reset();
 
         let (lamp_on, auto_on, lux, mot, energy_delta, p1_off, wattage) = {
             let state = DEVICE_STATE.lock().await;
@@ -3063,7 +3069,7 @@ async fn rtdb_state_reporter_task(stack: Stack<'static>) -> ! {
                 scratch.req_buf.clear();
                 let _ = write!(
                     scratch.req_buf,
-                    r#"{{"on":{},"auto":{},"lux":{},"mot":{},"ts":{{".sv":"timestamp"}},"energy_delta_sec":{},"p1_off":{},"wattage":{}}}"#,
+                    r#"{{"on":{},"auto":{},"lux":{},"mot":{},"online":true,"ts":{{".sv":"timestamp"}},"last_seen":{{".sv":"timestamp"}},"energy_delta_sec":{},"p1_off":{},"wattage":{}}}"#,
                     lamp_on, auto_on, lux, mot, energy_delta, p1_off, wattage
                 );
                 scratch.job = HttpsJob {
@@ -3076,14 +3082,36 @@ async fn rtdb_state_reporter_task(stack: Stack<'static>) -> ! {
                 ok
             };
             if !has_url {
-                Ok(401u16)
+                Ok((401u16, FixedBuf::<160>::new()))
             } else {
-                dispatch_https_job(|status, _| status).await
+                dispatch_https_job(|status, resp_body| {
+                    let mut err_buf = FixedBuf::<160>::new();
+                    if status != 200
+                        && let Ok(s) = core::str::from_utf8(resp_body)
+                    {
+                        for ch in s.trim().chars() {
+                            let mut tmp = [0u8; 4];
+                            let encoded = ch.encode_utf8(&mut tmp);
+                            if !err_buf.push_bytes(encoded.as_bytes()) {
+                                break;
+                            }
+                        }
+                    }
+                    (status, err_buf)
+                })
+                .await
             }
         };
 
         match patch_res {
-            Ok(200) => {
+            Ok((200, _)) => {
+                if immediate_publish {
+                    println!(
+                        "RTDB STATE: Initial/reconnect Online state published for {} (last_seen=.sv:timestamp).",
+                        device_id
+                    );
+                }
+                immediate_publish = false;
                 mark_rtdb_ok().await;
                 let mut remaining_energy = false;
                 {
@@ -3101,26 +3129,35 @@ async fn rtdb_state_reporter_task(stack: Stack<'static>) -> ! {
                     REPORTER_STATE_SIGNAL.signal(());
                 }
             }
-            Ok(code @ (401 | 403)) => {
+            Ok((code @ (401 | 403), err_body)) => {
+                immediate_publish = false;
                 println!(
-                    "RTDB STATE: Rejected with HTTP {}; triggering token refresh/check.",
-                    code
+                    "RTDB STATE: Rejected with HTTP {} ({}); triggering token refresh/check.",
+                    code,
+                    err_body.as_str()
                 );
                 mark_rtdb_auth_error().await;
                 AUTH_WAKE_SIGNAL.signal(());
-                Timer::after(Duration::from_secs(2)).await;
-                continue;
             }
-            Ok(status) => {
-                println!("RTDB STATE: PATCH returned HTTP {}", status);
+            Ok((status, err_body)) => {
+                println!(
+                    "RTDB STATE: PATCH returned HTTP {} ({})",
+                    status,
+                    err_body.as_str()
+                );
             }
             Err(e) => {
                 println!("RTDB STATE: PATCH failed ({}); keeping pending energy/p1_off.", e);
             }
         }
 
+        let wait_secs = if immediate_publish {
+            2
+        } else {
+            RTDB_HEARTBEAT_INTERVAL_SECS
+        };
         let _ = select(
-            Timer::after(Duration::from_secs(RTDB_HEARTBEAT_INTERVAL_SECS)),
+            Timer::after(Duration::from_secs(wait_secs)),
             REPORTER_STATE_SIGNAL.wait(),
         )
         .await;
